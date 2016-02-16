@@ -12,15 +12,24 @@
 
 #pragma once
 
+#include <cstdint>
+#include <type_traits>
+
 namespace peloton {
 namespace index {
+
+#if __GNUG__ && __GNUC__ < 5
+#define IS_TRIVIALLY_COPYABLE(T) __has_trivial_copy(T)
+#else
+#define IS_TRIVIALLY_COPYABLE(T) std::is_trivially_copyable<T>::value
+#endif
 
 template <typename KeyType, typename ValueType, typename Hasher>
 class MappingTable {
  public:
   // Constructor
   MappingTable();
-  MappingTable(uint32_t size);
+  MappingTable(uint32_t initial_size);
 
   // Get the mapping for the provided key
   ValueType get(KeyType key);
@@ -40,7 +49,7 @@ class MappingTable {
 
   // The mapping table. Note that the value must be copyable
   Entry* table_;
-  static_assert(std::is_trivially_copyable<ValueType>::value);
+  //static_assert(IS_TRIVIALLY_COPYABLE(ValueType));
 
   // What we use to hash keys
   Hasher key_hasher_;

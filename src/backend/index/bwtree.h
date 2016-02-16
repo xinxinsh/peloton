@@ -14,6 +14,10 @@
 
 #include "backend/index/mapping_table.h"
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
+
 namespace peloton {
 namespace index {
 
@@ -22,6 +26,10 @@ namespace index {
 template <typename KeyType, typename ValueType, class KeyComparator>
 class BWTree {
   typedef uint64_t pid_t;
+
+ public:
+  // Constructor
+  BWTree();
 
   // Insertion
   void insert(KeyType key, ValueType value);
@@ -76,7 +84,7 @@ class BWTree {
   struct LeafNode : public DataNode {
     // The (contiguous) array of values
     ValueType* vals;
-  }
+  };
 
   // A delta node has a type and a pointer to either the next delta node in the
   // chain, or to the base node. Note that this is an abstract base class for
@@ -115,7 +123,7 @@ class BWTree {
   // TODO: This structure is the same as the split node, code restructure?
   struct DeltaMerge : public DeltaNode {
     KeyType merge_key;
-    pid_d new_right;
+    pid_t new_right;
   };
 
   // A delta split entry indicates that the contents of the logical node
@@ -125,7 +133,7 @@ class BWTree {
   // 'new_right'
   struct DeltaSplit : public DeltaNode {
     KeyType split_key;
-    pid_d new_right;
+    pid_t new_right;
   };
 
   // An index delta indicates that a new index entry was added to this inner
@@ -144,8 +152,11 @@ class BWTree {
   };
 
  private:
+  // PID allocator
+  std::atomic<uint64_t> pid_allocator_;
+
   // The root of the tree
-  pid_t root_;
+  pid_t root_pid_;
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
 };

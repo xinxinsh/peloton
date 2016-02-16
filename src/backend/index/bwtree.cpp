@@ -15,7 +15,9 @@
 namespace peloton {
 namespace index {
 
-// Add your function definitions here
+void BWTree::insert(KeyType key, ValueType value) {
+  Node* node = get(root_);
+}
 
 }  // End index namespace
 }  // End peloton namespace

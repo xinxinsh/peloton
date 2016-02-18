@@ -16,7 +16,9 @@
 
 #include <atomic>
 #include <cstdint>
+#include <iterator>
 #include <functional>
+#include <vector>
 
 namespace peloton {
 namespace index {
@@ -27,34 +29,39 @@ template <typename KeyType, typename ValueType, class KeyComparator>
 class BWTree {
   typedef uint64_t pid_t;
 
- public:
-  // Constructor
-  BWTree();
-
-  // Insertion
-  void insert(KeyType key, ValueType value);
-
-  //
-
  private:
   // TODO: Figure out packing/padding and alignment
 
+  //===--------------------------------------------------------------------===//
   // Abstract base class of all nodes
+  //===--------------------------------------------------------------------===//
   struct Node {
     enum NodeType {
-      Base,
-      Delta,
+      Inner,
+      Leaf,
+      DeltaInsert,
+      DeltaDelete,
+      DeltaMerge,
+      DeltaMergeInner,
+      DeltaSplit,
+      DeltaSplitInner,
+      DeltaIndex,
+      DeltaDeleteIndex,
+      DeltaRemoveLeaf,
+      DeltaRemoveInner
     };
     // The type
     NodeType node_type;
   };
 
+  //===--------------------------------------------------------------------===//
   // All non-delta nodes are data nodes.  Data nodes contain a high and low
   // fence key, left and right sibling links and a list of keys stored
   // contiguously in this node.
   //
   // There are two types of data nodes, inner nodes store PID links to
   // children (one per key), and leaf nodes that store the values themselves
+  //===--------------------------------------------------------------------===//
   struct DataNode : public Node {
     // Low and high fence key
     KeyType low_key;
@@ -74,76 +81,83 @@ class BWTree {
     // This allows us to unify inner and leaf node types and simplify code
   };
 
+  //===--------------------------------------------------------------------===//
   // Inner nodes
+  //===--------------------------------------------------------------------===//
   struct InnerNode : public DataNode {
     // The (contiguous) array of child PID links
-    pid_t* pids;
+    pid_t* children;
   };
 
+  //===--------------------------------------------------------------------===//
   // Leaf nodes
+  //===--------------------------------------------------------------------===//
   struct LeafNode : public DataNode {
     // The (contiguous) array of values
     ValueType* vals;
   };
 
+  //===--------------------------------------------------------------------===//
   // A delta node has a type and a pointer to either the next delta node in the
   // chain, or to the base node. Note that this is an abstract base class for
   // all delta nodes
+  //===--------------------------------------------------------------------===//
   struct DeltaNode : public Node {
-    enum DeltaType {
-      Insert,
-      Delete,
-      Merge,
-      Split,
-      Index,
-      DeleteIndex,
-      RemoveNode
-    };
-    // The delta type and the next link in the delta chain
-    DeltaType type;
     Node* next;
   };
 
+  //===--------------------------------------------------------------------===//
   // A delta insert entry indicates that the stored key and value has been
   // inserted into the logical node
+  //===--------------------------------------------------------------------===//
   struct DeltaInsert : public DeltaNode {
     KeyType key;
     ValueType value;
   };
 
+  //===--------------------------------------------------------------------===//
   // A delta delete entry indicates that the stored key has been deleted
   // from the node.
+  //===--------------------------------------------------------------------===//
   struct DeltaDelete : public DeltaNode {
     KeyType key;
   };
 
+  //===--------------------------------------------------------------------===//
   // A delta merge entry indicates that the contents of the node pointed to by
   // 'old_right' are now included in this logical node.  For convenience,
   // the smallest key from that node is included here as 'merge_key'
   // TODO: This structure is the same as the split node, code restructure?
+  //===--------------------------------------------------------------------===//
   struct DeltaMerge : public DeltaNode {
     KeyType merge_key;
     pid_t new_right;
   };
 
+  //===--------------------------------------------------------------------===//
   // A delta split entry indicates that the contents of the logical node
   // have been split.  The key the split was performed at is stored under
   // the 'key' attribute here, and the PID of the node holding the data
   // whose key is greater than the key in this element is stored under
   // 'new_right'
+  //===--------------------------------------------------------------------===//
   struct DeltaSplit : public DeltaNode {
     KeyType split_key;
     pid_t new_right;
   };
 
+  //===--------------------------------------------------------------------===//
   // An index delta indicates that a new index entry was added to this inner
   // node.  We store the key and the child that stores the data
+  //===--------------------------------------------------------------------===//
   struct DeltaIndex : public DeltaNode {
     KeyType index_key;
     pid_t child_pid;
   };
 
+  //===--------------------------------------------------------------------===//
   // A simple hash scheme for the mapping table to use
+  //===--------------------------------------------------------------------===//
   struct DumbHash {
     std::hash<uint32_t> hash;
     size_t operator()(const pid_t& pid) {
@@ -151,12 +165,79 @@ class BWTree {
     }
   };
 
+  //===--------------------------------------------------------------------===//
+  // The iterator we use for scans
+  //===--------------------------------------------------------------------===//
+  class BwTreeIterator
+      : public std::iterator<std::input_iterator_tag, ValueType> {
+   public:
+    BwTreeIterator(uint32_t idx, Node* node,
+                   const std::vector<ValueType>&& collapsed_contents);
+
+    // Increment
+    BwTreeIterator& operator++();
+    // Equality/Inequality checks
+    BwTreeIterator operator==(const BwTreeIterator& other);
+    BwTreeIterator operator!=(const BwTreeIterator& other);
+    // Access
+    ValueType operator*();
+
+   private:
+    uint32_t curr_idx;
+    Node* curr_node;
+    const std::vector<ValueType> collapsed_contents;
+  };
+
+  //===--------------------------------------------------------------------===//
+  //
+  //===--------------------------------------------------------------------===//
+  struct FindDataNodeResult {
+    bool found;
+    pid_t node_pid;
+    Node* head;
+    Node* data_node;
+  };
+
+ public:
+  typedef typename BWTree<KeyType, ValueType, KeyComparator>::BwTreeIterator
+      Iterator;
+
+  // Constructor
+  BWTree();
+
+  // Insertion
+  void Insert(KeyType key, ValueType value);
+
+  // Return an iterator that points to the element that is associated with the
+  // provided key, or an iterator that is equal to what is returned by end()
+  Iterator Search(KeyType key);
+
+  // C++ container iterator functions (hence, why they're not capitalized)
+  Iterator begin() const;
+  Iterator end() const;
+
+ private:
+  // Given a key, perform a search for the node that stores the value fo the key
+  FindDataNodeResult FindDataNode(KeyType key) const;
+  Node* FindInNode(Node* node, KeyType key) const;
+
+  // Get the node with the given pid
+  Node* GetNode(pid_t node_pid) const { return mapping_table_.Get(node_pid); }
+
+  // Get the root node
+  Node* GetRoot() const { return GetNode(root_pid_.load()); }
+
+  // Is the given node a leaf node
+  bool IsLeaf(Node* node) const;
+
  private:
   // PID allocator
   std::atomic<uint64_t> pid_allocator_;
 
   // The root of the tree
-  pid_t root_pid_;
+  std::atomic<pid_t> root_pid_;
+  // The comparator used for key comparison
+  KeyComparator key_comparator_;
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
 };

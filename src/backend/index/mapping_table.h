@@ -12,17 +12,12 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 
 namespace peloton {
 namespace index {
-
-#if __GNUG__ && __GNUC__ < 5
-#define IS_TRIVIALLY_COPYABLE(T) __has_trivial_copy(T)
-#else
-#define IS_TRIVIALLY_COPYABLE(T) std::is_trivially_copyable<T>::value
-#endif
 
 template <typename KeyType, typename ValueType, typename Hasher>
 class MappingTable {
@@ -32,24 +27,30 @@ class MappingTable {
   MappingTable(uint32_t initial_size);
 
   // Get the mapping for the provided key
-  ValueType get(KeyType key);
+  ValueType Get(KeyType key);
 
   // CAS in the mapping for the provided key whose expected value is also provided
-  bool cas(KeyType key, ValueType old_val, ValueType new_val);
+  bool Cas(KeyType key, ValueType old_val, ValueType new_val);
 
   // Perform a blind set
-  bool insert(KeyType key, ValueType val);
+  bool Insert(KeyType key, ValueType val);
 
  private:
+  // The structures we actually store in the mapping table
   struct Entry {
     uint64_t hash;
     KeyType key;
-    ValueType val;
+    std::atomic<ValueType> val;
   };
 
-  // The mapping table. Note that the value must be copyable
+  // Get the entry for the provided key
+  Entry* EntryFor(KeyType& key);
+
+  // Hash a given key
+  uint64_t HashFor(KeyType key) const { return hasher_(key); }
+
+  // The mapping table
   Entry* table_;
-  //static_assert(IS_TRIVIALLY_COPYABLE(ValueType));
 
   // What we use to hash keys
   Hasher key_hasher_;

@@ -25,6 +25,13 @@ MappingTable<KeyType, ValueType, Hasher>::MappingTable(uint32_t initial_size) {
   table_ = new Entry[initial_size];
 }
 
+template <typename KeyType, typename ValueType, typename Hasher>
+MappingTable<KeyType, ValueType, Hasher>::~MappingTable() {
+  if (table_ != nullptr) {
+    delete[] table_;
+  }
+}
+
 // Get the mapping for the provided key
 template <typename KeyType, typename ValueType, typename Hasher>
 ValueType MappingTable<KeyType, ValueType, Hasher>::Get(KeyType key) {

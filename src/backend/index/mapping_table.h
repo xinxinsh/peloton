@@ -26,6 +26,9 @@ class MappingTable {
   MappingTable();
   MappingTable(uint32_t initial_size);
 
+  // Destructor
+  ~MappingTable();
+
   // Get the mapping for the provided key
   ValueType Get(KeyType key);
 

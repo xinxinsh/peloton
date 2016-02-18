@@ -46,7 +46,7 @@ bool MappingTable<KeyType, ValueType, Hasher>::Cas(KeyType key, ValueType old_va
   if (entry == nullptr) {
     return false;
   }
-  entry->val.compare_exchange_strong(old_val, new_val);
+  return entry->val.compare_exchange_strong(old_val, new_val);
 }
 
 // Perform a blind set
@@ -57,7 +57,7 @@ bool MappingTable<KeyType, ValueType, Hasher>::Insert(KeyType key, ValueType val
     return false;
   }
   uint64_t hash_value = HashFor(key);
-  table_.push_back(Entry{hash_value, key, val});
+  table_[hash_value] = Entry{hash_value, key, val};
 }
 
 }  // End index namespace

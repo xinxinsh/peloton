@@ -15,8 +15,8 @@
 namespace peloton {
 namespace index {
 
-// Add your function definitions here
-
+// Our map from NodeType => std::string for helpful error messages
+// Templates make this guy fugly
 template <typename KeyType, typename ValueType, class KeyComparator>
 const std::map<
     typename BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType,

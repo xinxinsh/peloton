@@ -250,7 +250,9 @@ class BWTree {
   // Find the leaf-level data node that stores the value associated with the
   // given key. This method is sufficiently general that it can be used for
   // insertions, deletions and scans.  Insertions can call this to get back
-  // the pid_t of the leaf that
+  // the pid_t of the leaf that the insertion should take place at.  The
+  // pid_t is sufficient to create a delta node and CAS it in.  The traversal
+  // path is also available if the node get's deleted while we're CASing in.
   FindDataNodeResult FindDataNode(const KeyType key) const;
 
   // Find the path to take to the given key in the given inner node
@@ -300,8 +302,9 @@ BWTree<KeyType, ValueType, KeyComparator>::BWTree(KeyComparator key_comparator)
 // FindDataNode
 //===----------------------------------------------------------------------===//
 template <typename KeyType, typename ValueType, class KeyComparator>
-typename BWTree<KeyType, ValueType, KeyComparator>::FindDataNodeResult BWTree<
-    KeyType, ValueType, KeyComparator>::FindDataNode(const KeyType key) const {
+typename BWTree<KeyType, ValueType, KeyComparator>::FindDataNodeResult
+BWTree<KeyType, ValueType, KeyComparator>::FindDataNode(const KeyType key)
+    const {
   // The path we take during the traversal/search
   std::stack<pid_t> traversal;
 

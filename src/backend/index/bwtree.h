@@ -2,9 +2,9 @@
 //
 //                         PelotonDB
 //
-// BWTree.h
+// bwtree.h
 //
-// Identification: src/backend/index/BWTree.h
+// Identification: src/backend/index/bwtree.h
 //
 // Copyright (c) 2015, Carnegie Mellon University Database Group
 //
@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <iterator>
 #include <functional>
+#include <limits>
 #include <vector>
 
 namespace peloton {
@@ -28,6 +29,7 @@ namespace index {
 template <typename KeyType, typename ValueType, class KeyComparator>
 class BWTree {
   typedef uint64_t pid_t;
+  static const pid_t kInvalidPid = std::numeric_limits<pid_t>::max();
 
  private:
   // TODO: Figure out packing/padding and alignment
@@ -148,10 +150,16 @@ class BWTree {
 
   //===--------------------------------------------------------------------===//
   // An index delta indicates that a new index entry was added to this inner
-  // node.  We store the key and the child that stores the data
+  // node as a result of a split of one of this node's children.  The low key
+  // represents the key that the split was performed on.  The high key is the
+  // previous key that would guide searches to the now-split node.  We include
+  // both here to quickly determine if a key should go to the newly creted node
+  // contianing half the entries from the node that was split.
+  // Refer to 'Parent Update' in Section IV.A of the paper for more details.
   //===--------------------------------------------------------------------===//
   struct DeltaIndex : public DeltaNode {
-    KeyType index_key;
+    KeyType low_key;
+    KeyType high_key;
     pid_t child_pid;
   };
 
@@ -171,7 +179,7 @@ class BWTree {
   class BwTreeIterator
       : public std::iterator<std::input_iterator_tag, ValueType> {
    public:
-    BwTreeIterator(uint32_t idx, Node* node,
+    BwTreeIterator(uint32_t idx, pid_t node_pid, Node* node,
                    const std::vector<ValueType>&& collapsed_contents);
 
     // Increment
@@ -184,18 +192,9 @@ class BWTree {
 
    private:
     uint32_t curr_idx;
-    Node* curr_node;
-    const std::vector<ValueType> collapsed_contents;
-  };
-
-  //===--------------------------------------------------------------------===//
-  //
-  //===--------------------------------------------------------------------===//
-  struct FindDataNodeResult {
-    bool found;
     pid_t node_pid;
-    Node* head;
-    Node* data_node;
+    Node* node;
+    const std::vector<ValueType> collapsed_contents;
   };
 
  public:
@@ -217,9 +216,25 @@ class BWTree {
   Iterator end() const;
 
  private:
+  //===--------------------------------------------------------------------===//
+  // The result of a search for a key in the tree
+  //===--------------------------------------------------------------------===//
+  struct FindDataNodeResult {
+    // Was a value found
+    bool found;
+    // The PID of the leaf node that contains the value
+    pid_t node_pid;
+    // The head (root) of the delta chain (if one exists)
+    Node* head;
+    // The actual data node
+    LeafNode* leaf_node;
+  };
+
   // Given a key, perform a search for the node that stores the value fo the key
   FindDataNodeResult FindDataNode(KeyType key) const;
-  Node* FindInNode(Node* node, KeyType key) const;
+
+  // Find the path to take to the given key in the given inner node
+  pid_t FindInInnerNode(Node* node, KeyType key) const;
 
   // Get the node with the given pid
   Node* GetNode(pid_t node_pid) const { return mapping_table_.Get(node_pid); }

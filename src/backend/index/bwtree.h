@@ -34,6 +34,27 @@ class BWTree {
   typedef uint64_t pid_t;
   static const pid_t kInvalidPid = std::numeric_limits<pid_t>::max();
 
+  // Forward declare so the typedef works
+  class BwTreeIterator;
+
+ public:
+  typedef typename BWTree<KeyType, ValueType, KeyComparator>::BwTreeIterator
+      Iterator;
+
+  // Constructor
+  BWTree(KeyComparator comparator);
+
+  // Insertion
+  void Insert(KeyType key, ValueType value);
+
+  // Return an iterator that points to the element that is associated with the
+  // provided key, or an iterator that is equal to what is returned by end()
+  Iterator Search(KeyType key);
+
+  // C++ container iterator functions (hence, why they're not capitalized)
+  Iterator begin() const;
+  Iterator end() const;
+
  private:
   // TODO: Figure out packing/padding and alignment
 
@@ -200,25 +221,6 @@ class BWTree {
     const std::vector<ValueType> collapsed_contents;
   };
 
- public:
-  typedef typename BWTree<KeyType, ValueType, KeyComparator>::BwTreeIterator
-      Iterator;
-
-  // Constructor
-  BWTree(KeyComparator comparator);
-
-  // Insertion
-  void Insert(KeyType key, ValueType value);
-
-  // Return an iterator that points to the element that is associated with the
-  // provided key, or an iterator that is equal to what is returned by end()
-  Iterator Search(KeyType key);
-
-  // C++ container iterator functions (hence, why they're not capitalized)
-  Iterator begin() const;
-  Iterator end() const;
-
- private:
   //===--------------------------------------------------------------------===//
   // The result of a search for a key in the tree
   //===--------------------------------------------------------------------===//
@@ -232,6 +234,9 @@ class BWTree {
     // The actual data node
     LeafNode* leaf_node;
   };
+
+ private:
+  // Private APIs
 
   // Given a key, perform a search for the node that stores the value fo the key
   FindDataNodeResult FindDataNode(KeyType key) const;
@@ -271,7 +276,6 @@ BWTree<KeyType, ValueType, KeyComparator>::BWTree(KeyComparator key_comparator)
   Node* root = new LeafNode();
   mapping_table_.Insert(root_pid_, root);
 }
-
 
 //===----------------------------------------------------------------------===//
 // FindDataNode

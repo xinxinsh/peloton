@@ -21,6 +21,7 @@
 #include <iterator>
 #include <functional>
 #include <limits>
+#include <map>
 #include <stack>
 #include <vector>
 
@@ -79,6 +80,8 @@ class BWTree {
     // The type
     NodeType node_type;
   };
+
+  static const std::map<typename Node::NodeType, std::string> kNodeTypeToString;
 
   //===--------------------------------------------------------------------===//
   // All non-delta nodes are data nodes.  Data nodes contain a high and low
@@ -227,22 +230,39 @@ class BWTree {
   struct FindDataNodeResult {
     // Was a value found
     bool found;
+    // The slot to find the value
+    uint32_t slot_idx;
     // The PID of the leaf node that contains the value
     pid_t node_pid;
     // The head (root) of the delta chain (if one exists)
     Node* head;
-    // The actual data node
+    // The data was either found in the leaf node or a delta node.  Only one of
+    // the following two pointers should be non-null if found is true.
+    DeltaNode* delta_node;
     LeafNode* leaf_node;
+    // The path the search took
+    std::stack<pid_t> traversal_path;
   };
 
  private:
   // Private APIs
 
-  // Given a key, perform a search for the node that stores the value fo the key
-  FindDataNodeResult FindDataNode(KeyType key) const;
+  // Find the leaf-level data node that stores the value associated with the
+  // given key. This method is sufficiently general that it can be used for
+  // insertions, deletions and scans.  Insertions can call this to get back
+  // the pid_t of the leaf that the insertion should take place at.  The
+  // pid_t is sufficient to create a delta node and CAS it in.  The traversal
+  // path is also available if the node get's deleted while we're CASing in.
+  FindDataNodeResult FindDataNode(const KeyType key) const;
 
   // Find the path to take to the given key in the given inner node
-  pid_t FindInInnerNode(Node* node, KeyType key) const;
+  pid_t FindInInnerNode(const Node* node, const KeyType key) const;
+
+  // Find the given key in the provided leaf node.  If found, assign the value
+  // reference to the value from the leaf and return true. Otherwise, return
+  // false if not found in the leaf.
+  void FindInLeafNode(const Node* node, const KeyType key,
+                      FindDataNodeResult& res) const;
 
   // Get the node with the given pid
   Node* GetNode(pid_t node_pid) const { return mapping_table_.Get(node_pid); }
@@ -270,7 +290,8 @@ class BWTree {
 //===----------------------------------------------------------------------===//
 template <typename KeyType, typename ValueType, class KeyComparator>
 BWTree<KeyType, ValueType, KeyComparator>::BWTree(KeyComparator key_comparator)
-    : pid_allocator_(0), root_pid_(pid_allocator_++),
+    : pid_allocator_(0),
+      root_pid_(pid_allocator_++),
       key_comparator_(key_comparator) {
   // Create a new root page
   Node* root = new LeafNode();
@@ -282,18 +303,22 @@ BWTree<KeyType, ValueType, KeyComparator>::BWTree(KeyComparator key_comparator)
 //===----------------------------------------------------------------------===//
 template <typename KeyType, typename ValueType, class KeyComparator>
 typename BWTree<KeyType, ValueType, KeyComparator>::FindDataNodeResult
-BWTree<KeyType, ValueType, KeyComparator>::FindDataNode(KeyType key) const {
+BWTree<KeyType, ValueType, KeyComparator>::FindDataNode(const KeyType key)
+    const {
   // The path we take during the traversal/search
   std::stack<pid_t> traversal;
 
   pid_t curr = root_pid_.load();
-  traversal.push(curr);
   while (true) {
     assert(curr != kInvalidPid);
     Node* curr_node = GetNode(curr);
     if (IsLeaf(curr_node)) {
-      // The current node is a leaf.  If the leaf has been removed (due to merge),
-      // we go back up the tree and re-traverse, otherwise we're really at a leaf node
+      // The node we're at is a leaf. If the leaf has been deleted (due to a
+      // merge), we have to go back up to the parent and re-traverse to find
+      // the correct leaf that has its contents.  Otherwise we're really at a
+      // leaf node
+      // NOTE: It can be guaranteed that if the node has been deleted, the
+      //       last delta (head of the chain) MUST be a DeltaRemoveNode.
       if (curr_node->node_type != Node::NodeType::DeltaRemoveLeaf) {
         break;
       } else {
@@ -310,28 +335,24 @@ BWTree<KeyType, ValueType, KeyComparator>::FindDataNode(KeyType key) const {
         curr = traversal.top();
         traversal.pop();
       } else {
-        traversal.push(child);
+        traversal.push(curr);
         curr = child;
       }
     }
   }
 
-  /*
-  // We're at a base page, meaning that the key does not exist anywhere in
-  // the delta chain.  At this point, we can just binary search the node
-  // for the index
-  LeafNode* leaf = static_cast<LeafNode*>(curr_node);
-  auto iter = std::lower_bound(leaf->keys, leaf->keys+leaf->num_entries,
-                               key_comparator_);
-  bool found = (iter - leaf->keys) < leaf->num_entries;
-  return FindDataNodeResult{found, traversal.top(), nullptr, leaf};
-  */
+  // Probe the leaf
+  FindDataNodeResult result;
+  result.node_pid = curr;
+  result.head = GetNode(curr);
+  result.traversal_path = traversal;
+  return FindInLeafNode(result.head, key, result);
 }
 
 template <typename KeyType, typename ValueType, class KeyComparator>
 typename BWTree<KeyType, ValueType, KeyComparator>::pid_t
-BWTree<KeyType, ValueType, KeyComparator>::FindInInnerNode(Node* node,
-                                                           KeyType key) const {
+BWTree<KeyType, ValueType, KeyComparator>::FindInInnerNode(
+    const Node* node, const KeyType key) const {
   assert(node != nullptr);
   assert(!IsLeaf(node));
 
@@ -389,10 +410,93 @@ BWTree<KeyType, ValueType, KeyComparator>::FindInInnerNode(Node* node,
         // Go back up the traversal path and try again
         return kInvalidPid;
       }
+      default:
+        // Anything else should be impossible for inner nodes
+        LOG_DEBUG("Hit node %s on inner node traversal.  This is impossible!",
+                  kNodeTypeToString[curr_node->type].c_str());
+        assert(false);
     }
   }
   // Should never happen
   assert(false);
+}
+
+template <typename KeyType, typename ValueType, class KeyComparator>
+void BWTree<KeyType, ValueType, KeyComparator>::FindInLeafNode(
+    const Node* node, const KeyType key,
+    typename BWTree<KeyType, ValueType, KeyComparator>::FindDataNodeResult&
+        result) const {
+  assert(IsLeaf(node));
+
+  Node* curr = node;
+  while (true) {
+    switch (curr->type) {
+      case Node::NodeType::Leaf: {
+        // A true blue leaf, just binary search this guy
+        LeafNode* leaf = static_cast<LeafNode*>(curr);
+        auto iter = std::lower_bound(
+            leaf->keys, leaf->keys + leaf->num_entries, key,key_comparator_);
+        uint32_t index = iter - leaf->keys;
+        result.found = index < leaf->num_entries;
+        result.slot_idx = index;
+        result.delta_node = nullptr;
+        result.leaf_node = curr;
+        return;
+      }
+      case Node::NodeType::DeltaInsert: {
+        // Check if the inserted key is what we're looking for
+        DeltaInsert* insert = static_cast<DeltaInsert*>(curr);
+        if (key_comparator_(key, insert->key) == 0) {
+          // The insert was for the key we're looking for
+          result.found = true;
+          result.slot_idx = 0;
+          result.delta_node = curr;
+          result.leaf_node = nullptr;
+          return;
+        }
+        curr = curr->next;
+        break;
+      }
+      case Node::NodeType::DeltaDelete: {
+        // Check if the key we're looking for has been deleted
+        DeltaDelete* del = static_cast<DeltaDelete*>(curr);
+        if (key_comparator_(key, del->key) == 0) {
+          // The key/value was deleted
+          result.found = false;
+          result.slot_idx = 0;
+          result.delta_node = nullptr;
+          result.leaf_node = nullptr;
+          return;
+        }
+        curr = curr->next;
+        break;
+      }
+      case Node::NodeType::DeltaMerge: {
+        DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
+        if (key_comparator_(key, merge->merge_key) < 0) {
+          // The key is still in this logical node
+          curr = curr->next;
+        } else {
+          curr = merge->new_right;
+        }
+        break;
+      }
+      case Node::NodeType::DeltaSplit: {
+        DeltaSplit* split = static_cast<DeltaSplit*>(curr);
+        if (key_comparator_(key, split->split_key) < 0) {
+          curr = curr->next;
+        } else {
+          curr = split->new_right;
+        }
+        break;
+      }
+      default: {
+        LOG_DEBUG("Hit node %s on leaf traversal.  This is impossible!",
+                  kNodeTypeToString[curr->type].c_str());
+        assert(false);
+      }
+    }
+  }
 }
 
 template <typename KeyType, typename ValueType, class KeyComparator>
@@ -453,7 +557,6 @@ BWTree<KeyType, ValueType, KeyComparator>::Search(KeyType key) {
   }
   return Iterator{0, result.node, vals};
 }
-
 
 }  // End index namespace
 }  // End peloton namespace

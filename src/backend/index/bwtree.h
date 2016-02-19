@@ -422,6 +422,15 @@ template <typename KeyType, typename ValueType, class KeyComparator>
 void BWTree<KeyType, ValueType, KeyComparator>::Insert(KeyType key,
                                                        ValueType value) {
   // TODO: Fill me out
+  FindDataNodeResult result = FindDataNode(key);
+  Node* prevRoot = result->leaf_node;
+  if (result->head) prevRoot = result->head;
+  Node* deltaInsert = DeltaInsert{Node.DeltaInsert, prevRoot, key, value};
+  pid_t rootPid = result->node_pid;
+  while (!mapping_table_.Cas(rootPid, prevRoot, deltaInsert) {
+    prevRoot = mapping_table_.Get(rootPid);
+    deltaInsert->next = prevRoot;
+  }
 }
 
 //===----------------------------------------------------------------------===//

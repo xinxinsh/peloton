@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <iterator>
 #include <functional>
+#include <set>
 #include <limits>
 #include <map>
 #include <stack>
@@ -42,6 +43,7 @@ class BWTree {
   typedef typename BWTree<KeyType, ValueType, KeyComparator>::BwTreeIterator
       Iterator;
 
+  typedef typename std::multiset<std::pair<KeyType, ValueType>> KVMultiset; 
   // Constructor
   BWTree(KeyComparator comparator);
 
@@ -142,6 +144,7 @@ class BWTree {
   struct DeltaInsert : public DeltaNode {
     KeyType key;
     ValueType value;
+    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -150,6 +153,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct DeltaDelete : public DeltaNode {
     KeyType key;
+    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -161,6 +165,7 @@ class BWTree {
   struct DeltaMerge : public DeltaNode {
     KeyType merge_key;
     pid_t new_right;
+    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -173,6 +178,9 @@ class BWTree {
   struct DeltaSplit : public DeltaNode {
     KeyType split_key;
     pid_t new_right;
+    // TODO: fix this by refactoring or sth
+    // Zero for DeltaSplitInner
+    uint32_t num_entries; // of the original branch (ie left)
   };
 
   //===--------------------------------------------------------------------===//
@@ -273,6 +281,10 @@ class BWTree {
   // Is the given node a leaf node
   bool IsLeaf(Node* node) const;
 
+  //TODO:comment 
+  KVMultiset& getKVsLeaf(Node *node, KVMultiset& deltaKVs, std::set<KeyType>& deleted);
+  KVMultiset& getKVsDeltaAndLeaf(DeltaNode *node);
+  void Split(LeafNode* leaf, pid_t leaf_pid, DeltaNode* node);
  private:
   // PID allocator
   std::atomic<uint64_t> pid_allocator_;
@@ -283,6 +295,8 @@ class BWTree {
   KeyComparator key_comparator_;
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
+  // Functions and variables for insert
+  int insert_branch_factor = 500;
 };
 
 //===----------------------------------------------------------------------===//
@@ -491,7 +505,7 @@ void BWTree<KeyType, ValueType, KeyComparator>::FindInLeafNode(
         break;
       }
       default: {
-        LOG_DEBUG("Hit node %s on leaf traversal.  This is impossible!",
+        log_debug("hit node %s on leaf traversal.  this is impossible!",
                   kNodeTypeToString[curr->type].c_str());
         assert(false);
       }
@@ -523,17 +537,143 @@ bool BWTree<KeyType, ValueType, KeyComparator>::IsLeaf(Node* node) const {
 // Insert
 //===----------------------------------------------------------------------===//
 template <typename KeyType, typename ValueType, class KeyComparator>
+typename BWTree<KeyType, ValueType, KeyComparator>::KVMultiset&
+BWTree<KeyType, ValueType, KeyComparator>::getKVsLeaf(Node *node, KVMultiset& deltaKVs, std::set<KeyType>& deleted) {
+  for (int i = 0; i < node->num_entries; i++) {
+    auto it = deleted.find(node->keys[i]);
+    if (it == deleted.end()) {
+      deltaKVs->insert(std::make_tuple(node->keys[i], node->vals[i]));
+    }
+  }
+  return deltaKVs;
+}
+
+template <typename KeyType, typename ValueType, class KeyComparator>
+typename BWTree<KeyType, ValueType, KeyComparator>::KVMultiset&
+BWTree<KeyType, ValueType, KeyComparator>::getKVsDeltaAndLeaf(DeltaNode *node) {
+  Node* cur = node->next;
+  // TODO: unique ptr?
+  KVMultiset* kvs = new std::multiset<std::pair<KeyType, ValueType>>();
+  std::set<KeyType> deleted = new std::set<KeyType>();
+  while (cur) {
+    switch (cur->node_type){
+      case Node::NodeType::DeltaInsert: {
+        auto it = deleted.find(cur->key);
+        if (it == deleted.end()) {
+          auto t = std::make_tuple(cur->key, cur->value);
+          kvs.insert(t);
+        }
+        break;
+      }
+      case Node::NodeType::DeltaDelete: {
+        deleted.insert(cur->key);
+        break;
+      }
+      case Node::NodeType::DeltaMerge: {
+        // TODO: Watch out for stale references in multithreading mode.
+        KVMultiset& right_set = getKVsAndCountDelta(mapping_table_.Get(cur->new_right));
+        kvs.insert(right_set.begin(), right_set.end());
+        break;
+      }
+      case Node::NodeType::DeltaSplit:
+        //TODO: this might not be the case in multithreading.
+        // Keep traversing down the current chain.
+        break;
+      case Node::NodeType::Leaf: {
+        return getKVsAndCountLeaf(cur, kvs, deleted);    
+      }
+      default: {
+      // TODO: With single threading, nothing in the chain can be DeltaRemoveLeaf.
+      // In multithreading, there might be some weird cases.
+        log_debug("hit node %s on insert.  this is impossible!",
+                  kNodeTypeToString[cur->type].c_str());
+        assert(false);
+      }
+    }
+    cur = cur->next;
+  }
+}
+
+template <typename KeyType, typename ValueType, class KeyComparator>
+void BWTree<KeyType, ValueType, KeyComparator>::Split(LeafNode* leaf, pid_t leaf_pid, DeltaNode* node) {
+  //TODO: Handle duplicate keys
+  KVMultiset& KVs = getKVsDeltaAndLeaf(node);
+  std::vector<std::pair<KeyType, ValueType>> kv_vec(KVs.begin(), KVs.end());
+  int split_idx = kv_vec.size() / 2;
+  std::vector<std::pair<KeyType, ValueType>> kv_split_vec(
+      std::make_move_iterator(kv_vec.begin() + split_idx),
+      std::make_move_iterator(kv_vec.end()));
+  std::vector<KeyType>* split_vec_keys = new std::vector<KeyType>(kv_split_vec.size());
+  std::vector<ValueType>* split_vec_values = new std::vector<ValueType>(kv_split_vec.size());
+  for (auto it = std::make_move_iterator(kv_split_vec.begin()),
+               end = std::make_move_iterator(kv_split_vec.end()); it != end; ++it) {
+    split_vec_keys.push_back(std::move(it->first));
+    split_vec_values.push_back(std::move(it->second));
+  }
+  KeyType split_key = std::get<KeyType>(kv_vec[split_idx - 1]);
+  KeyType low_key = std::get<KeyType>(kv_split_vec[0]);
+  KeyType high_key = std::get<KeyType>(kv_split_vec[kv_split_vec.size() - 1]);
+  pid_t left_link = leaf_pid;
+  pid_t right_link = node->right_link;
+
+  //TODO: use initializer lists
+  LeafNode *right_sibling = new LeafNode();
+
+  right_sibling->low_key = low_key;
+  right_sibling->high_key = high_key;
+  right_sibling->right_link = right_link;
+  right_sibling->left_link = left_link;
+  right_sibling->num_entries = kv_split_vec.size();
+  right_sibling->keys = &split_vec_keys[0];
+  right_sibling->vals = &split_vec_values[0];
+    
+  right_sibling->next = node;
+  right_sibling->node_type = Node::NodeType::Leaf;
+  pid_t sibling_pid = pid_allocator_++;
+  mapping_table_.insert(sibling_pid, right_sibling);
+  //TODO: what happens wit multithreading?
+  leaf->right_link = sibling_pid;
+  
+  DeltaSplit* delta_split = new DeltaSplit();
+  delta_split->split_key = split_key;
+  delta_split->new_right = sibling_pid;
+  delta_split->num_entries = kv_vec.size() - kv_split_vec.size();
+
+  //TODO: need to retraverse in multithreading;
+  mapping_table_.Cas(leaf_pid, node, delta_split);
+  
+  // Install index
+  DeltaSplit* split_index = new DeltaSplit();
+  split_index->node_type = Node::NodeType::DeltaSplitInner;
+  split_index->split_key = split_key;
+  split_index->new_right = sibling_pid;
+  // TODO: fix this for multithreading
+  split_index->next = node;
+
+  //TODO: need to retraverse in multithreading;
+  mapping_table_.Cas(leaf_pid, delta_split, split_index);
+}
+
+template <typename KeyType, typename ValueType, class KeyComparator>
 void BWTree<KeyType, ValueType, KeyComparator>::Insert(KeyType key,
                                                        ValueType value) {
-  // TODO: Fill me out
   FindDataNodeResult result = FindDataNode(key);
   Node* prevRoot = result->leaf_node;
   if (result->head) prevRoot = result->head;
-  Node* deltaInsert = DeltaInsert{Node.DeltaInsert, prevRoot, key, value};
+  uint32_t num_entries = prevRoot->num_entries + 1;
+  //TODO If remove, goto left sibling and insert there in multithreading case
+  DeltaInsert* deltaInsert = DeltaInsert{key, value, num_entries};
+  // TODO: make this class into c++ initializer list
+  deltaInsert->node_type = Node::NodeType::DeltaInsert;
+  deltaInsert->next = prevRoot;
   pid_t rootPid = result->node_pid;
-  while (!mapping_table_.Cas(rootPid, prevRoot, deltaInsert) {
+  while (!mapping_table_.Cas(rootPid, prevRoot, deltaInsert)) {
+    //TODO: need to retraverse in multithreading
     prevRoot = mapping_table_.Get(rootPid);
     deltaInsert->next = prevRoot;
+  }
+  if (num_entries > insert_branch_factor) {
+    //Split(result->leaf_node, node_pid, deltaInsert);
   }
 }
 

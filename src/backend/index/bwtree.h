@@ -403,7 +403,7 @@ class BWTree {
           // At an inner node, do binary search to find child
           InnerNode* inner = static_cast<InnerNode*>(curr_node);
           auto iter = std::lower_bound(
-              inner->keys, inner->keys + inner->num_entries, key_comparator_);
+              inner->keys, inner->keys + inner->num_entries, key, key_comparator_);
           uint32_t child_index = iter - inner->keys;
           return inner->children[std::min(child_index, inner->num_entries - 1)];
         }
@@ -748,6 +748,7 @@ class BWTree {
       case Node::NodeType::DeltaRemoveInner:
         return false;
     }
+    return false;
   }
 
  private:

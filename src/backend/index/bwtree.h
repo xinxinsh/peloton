@@ -415,7 +415,7 @@ class BWTree {
           if (key_comparator_(key, merge->merge_key) <= 0) {
             curr_node = merge->next;
           } else {
-            curr_node = mapping_table_.Get(merge->new_right);
+            curr_node = GetNode(merge->new_right);
           }
           break;
         }
@@ -426,11 +426,11 @@ class BWTree {
           if (key_comparator_(key, split->split_key) <= 0) {
             curr_node = split->next;
           } else {
-            curr_node = split->new_right;
+            curr_node = GetNode(split->new_right);
           }
           break;
         }
-        case Node::NodeType::DelaIndex: {
+        case Node::NodeType::DeltaIndex: {
           // If delta.low_key < key <= delta.high_key, then we follow the path
           // to the child this index entry points to
           DeltaIndex* index = static_cast<DeltaIndex*>(curr_node);
@@ -438,7 +438,7 @@ class BWTree {
               key_comparator_(key, index->high_key) <= 0) {
             curr_node = GetNode(index->child_pid);
           } else {
-            curr_node = curr_node->next;
+            curr_node = index->next;
           }
           break;
         }
@@ -467,9 +467,9 @@ class BWTree {
   void FindInLeafNode(const Node* node, const KeyType key, FindDataNodeResult& result) const {
     assert(IsLeaf(node));
 
-    Node* curr = node;
+    Node* curr = (Node*) node;
     while (true) {
-      switch (curr->type) {
+      switch (curr->node_type) {
         case Node::NodeType::Leaf: {
           // A true blue leaf, just binary search this guy
           LeafNode* leaf = static_cast<LeafNode*>(curr);
@@ -479,7 +479,7 @@ class BWTree {
           result.found = index < leaf->num_entries;
           result.slot_idx = index;
           result.delta_node = nullptr;
-          result.leaf_node = curr;
+          result.leaf_node = leaf;
           return;
         }
         case Node::NodeType::DeltaInsert: {
@@ -489,11 +489,11 @@ class BWTree {
             // The insert was for the key we're looking for
             result.found = true;
             result.slot_idx = 0;
-            result.delta_node = curr;
+            result.delta_node = insert;
             result.leaf_node = nullptr;
             return;
           }
-          curr = curr->next;
+          curr = insert->next;
           break;
         }
         case Node::NodeType::DeltaDelete: {
@@ -507,25 +507,25 @@ class BWTree {
             result.leaf_node = nullptr;
             return;
           }
-          curr = curr->next;
+          curr = del->next;
           break;
         }
         case Node::NodeType::DeltaMerge: {
           DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
           if (key_comparator_(key, merge->merge_key) < 0) {
             // The key is still in this logical node
-            curr = curr->next;
+            curr = merge->next;
           } else {
-            curr = merge->new_right;
+            curr = GetNode(merge->new_right);
           }
           break;
         }
         case Node::NodeType::DeltaSplit: {
           DeltaSplit* split = static_cast<DeltaSplit*>(curr);
           if (key_comparator_(key, split->split_key) < 0) {
-            curr = curr->next;
+            curr = split->next;
           } else {
-            curr = split->new_right;
+            curr = GetNode(split->new_right);
           }
           break;
         }

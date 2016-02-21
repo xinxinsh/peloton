@@ -135,6 +135,8 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct DeltaNode : public Node {
     Node* next;
+    // TODO: determine if this needs to be here (needed bc of casting in insert)
+    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -144,7 +146,6 @@ class BWTree {
   struct DeltaInsert : public DeltaNode {
     KeyType key;
     ValueType value;
-    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -153,7 +154,6 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct DeltaDelete : public DeltaNode {
     KeyType key;
-    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -165,7 +165,6 @@ class BWTree {
   struct DeltaMerge : public DeltaNode {
     KeyType merge_key;
     pid_t new_right;
-    uint32_t num_entries;
   };
 
   //===--------------------------------------------------------------------===//
@@ -180,7 +179,7 @@ class BWTree {
     pid_t new_right;
     // TODO: fix this by refactoring or sth
     // Zero for DeltaSplitInner
-    uint32_t num_entries; // of the original branch (ie left)
+    // num_entries is sizeo f the original branch (ie left)
   };
 
   //===--------------------------------------------------------------------===//
@@ -536,6 +535,7 @@ bool BWTree<KeyType, ValueType, KeyComparator>::IsLeaf(Node* node) const {
 //===----------------------------------------------------------------------===//
 // Insert
 //===----------------------------------------------------------------------===//
+//TODO: Fix all these memory leaks man
 template <typename KeyType, typename ValueType, class KeyComparator>
 typename BWTree<KeyType, ValueType, KeyComparator>::KVMultiset&
 BWTree<KeyType, ValueType, KeyComparator>::getKVsLeaf(Node *node, KVMultiset& deltaKVs, std::set<KeyType>& deleted) {
@@ -658,22 +658,27 @@ template <typename KeyType, typename ValueType, class KeyComparator>
 void BWTree<KeyType, ValueType, KeyComparator>::Insert(KeyType key,
                                                        ValueType value) {
   FindDataNodeResult result = FindDataNode(key);
-  Node* prevRoot = result->leaf_node;
-  if (result->head) prevRoot = result->head;
-  uint32_t num_entries = prevRoot->num_entries + 1;
+  Node* prevRoot = result.leaf_node;
+  uint32_t num_entries = result.leaf_node->num_entries + 1;
+  if (result.head) {
+    DeltaNode* delta = static_cast<DeltaNode*>(result.head);
+    prevRoot = result.head;
+    num_entries = delta->num_entries;
+  }
   //TODO If remove, goto left sibling and insert there in multithreading case
-  DeltaInsert* deltaInsert = DeltaInsert{key, value, num_entries};
+  DeltaInsert* deltaInsert = new DeltaInsert();
+  deltaInsert->key = key; deltaInsert->value = value;
   // TODO: make this class into c++ initializer list
   deltaInsert->node_type = Node::NodeType::DeltaInsert;
   deltaInsert->next = prevRoot;
-  pid_t rootPid = result->node_pid;
+  pid_t rootPid = result.node_pid;
   while (!mapping_table_.Cas(rootPid, prevRoot, deltaInsert)) {
     //TODO: need to retraverse in multithreading
     prevRoot = mapping_table_.Get(rootPid);
     deltaInsert->next = prevRoot;
   }
   if (num_entries > insert_branch_factor) {
-    //Split(result->leaf_node, node_pid, deltaInsert);
+    //Split(result.leaf_node, node_pid, deltaInsert);
   }
 }
 

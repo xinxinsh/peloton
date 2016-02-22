@@ -215,11 +215,11 @@ class BWTree {
   // Our STL iterator over the tree.  We use this guy for both forward and
   // reverse scans
   //===--------------------------------------------------------------------===//
-  class BWTreeIterator: public std::iterator<std::input_iterator_tag, ValueType> {
+  class BWTreeIterator: public std::iterator<std::input_iterator_tag, std::pair<KeyType, ValueType>> {
    public:
     BWTreeIterator(const BWTree<KeyType, ValueType, KeyComparator>& tree,
                    uint32_t curr_idx, pid_t node_pid, Node* node,
-                   std::vector<ValueType>&& collapsed_contents)
+                   std::vector<std::pair<KeyType, ValueType>>&& collapsed_contents)
         : tree_(tree),
           curr_idx_(curr_idx),
           node_pid_(node_pid),
@@ -266,17 +266,19 @@ class BWTree {
       return !(*this == other);
     }
 
-    ValueType operator*() const {
-      return data();
+    std::pair<KeyType, ValueType> operator*() const {
+      return collapsed_contents_[curr_idx_];
     }
 
     // Access to the key the iterator points to
-    KeyType key() const;
+    KeyType key() const {
+      return collapsed_contents_[curr_idx_].first;
+    }
 
     // Access to the value the iterator points to
     ValueType data() const {
       // TODO: Bounds check
-      return collapsed_contents_[curr_idx_];
+      return collapsed_contents_[curr_idx_].second;
     }
 
    private:
@@ -284,7 +286,7 @@ class BWTree {
     uint32_t curr_idx_;
     pid_t node_pid_;
     Node* node_;
-    std::vector<ValueType> collapsed_contents_;
+    std::vector<std::pair<KeyType, ValueType>> collapsed_contents_;
   };
 
  public:
@@ -349,7 +351,7 @@ class BWTree {
 
     // Collapse the chain+delta into a vector of values
     assert(IsLeaf(result.head));
-    std::vector<ValueType> vals;
+    std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(result.head, vals);
     Node* base_leaf = nullptr;
     if (result.leaf_node != nullptr) {
@@ -368,13 +370,13 @@ class BWTree {
   // C++ container iterator functions (hence, why they're not capitalized)
   Iterator begin() const {
     Node* leftmost_leaf = GetNode(leftmost_leaf_pid_);
-    std::vector<ValueType> vals;
+    std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(leftmost_leaf, vals);
     return Iterator{*this, 0, leftmost_leaf_pid_, leftmost_leaf, std::move(vals)};
   }
 
   Iterator end() const {
-    std::vector<ValueType> empty;
+    std::vector<std::pair<KeyType, ValueType>> empty;
     return Iterator{*this, 0, kInvalidPid, nullptr, std::move(empty)};
   }
 
@@ -582,7 +584,7 @@ class BWTree {
     }
   }
 
-  void CollapseLeafData(Node* node, std::vector<ValueType>& output) const {
+  void CollapseLeafData(Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
     assert(IsLeaf(node));
 
     // We use vectors here to track inserted key/value pairs.  Yes, lookups
@@ -668,6 +670,7 @@ class BWTree {
     for (uint32_t i = 0; i < inserted_keys.size(); i++) {
       auto pos = std::lower_bound(all_keys.begin(), all_keys.end(), inserted_keys[i], key_comparator_);
       uint32_t index = all_keys.end() - pos;
+      all_keys.insert(all_keys.begin() + index, inserted_keys[i]);
       all_vals.insert(all_vals.begin() + index, inserted_vals[i]);
     }
 
@@ -675,11 +678,12 @@ class BWTree {
     for (uint32_t i = 0; i < deleted_keys.size(); i++) {
       auto pos = std::lower_bound(all_keys.begin(), all_keys.end(), deleted_keys[i], key_comparator_);
       uint32_t index = all_keys.end() - pos;
+      all_keys.erase(all_keys.begin() + index);
       all_vals.erase(all_vals.begin() + index);
     }
 
     for (uint32_t i = 0; i < all_vals.size(); i++) {
-      output.push_back(all_vals[i]);
+      output.push_back(std::make_pair(all_keys[i],all_vals[i]));
     }
   }
 

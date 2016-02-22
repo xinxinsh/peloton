@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "backend/common/logger.h"
 #include "backend/index/mapping_table.h"
 
 #include <algorithm>
@@ -122,6 +123,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   // A delta insert entry indicates that the stored key and value has been
   // inserted into the logical node
+  // TODO: Delta insert and delete are the same structure, refactor?
   //===--------------------------------------------------------------------===//
   struct DeltaInsert : public DeltaNode {
     KeyType key;
@@ -134,13 +136,14 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct DeltaDelete : public DeltaNode {
     KeyType key;
+    ValueType value;
   };
 
   //===--------------------------------------------------------------------===//
   // A delta merge entry indicates that the contents of the node pointed to by
   // 'old_right' are now included in this logical node.  For convenience,
   // the smallest key from that node is included here as 'merge_key'
-  // TODO: This structure is the same as the split node, code restructure?
+  // TODO: This structure is the same as the split node, refactor?
   //===--------------------------------------------------------------------===//
   struct DeltaMerge : public DeltaNode {
     KeyType merge_key;
@@ -247,7 +250,7 @@ class BWTree {
         } else {
           Node* right_node = tree_.GetNode(right_sibling);
           collapsed_contents_.clear();
-          assert(IsLeaf(right_node));
+          assert(tree_.IsLeaf(right_node));
           tree_.CollapseLeafData(right_node, collapsed_contents_);
         }
       }
@@ -491,8 +494,8 @@ class BWTree {
         }
         default:
           // Anything else should be impossible for inner nodes
-          LOG_DEBUG("Hit node %s on inner node traversal.  This is impossible!",
-                    kNodeTypeToString[curr_node->type].c_str());
+          //const std::string type = kNodeTypeToString[curr_node->node_type];
+          LOG_DEBUG("Hit node on inner node traversal.  This is impossible!");
           assert(false);
       }
     }
@@ -569,15 +572,17 @@ class BWTree {
           break;
         }
         default: {
+          /*
           LOG_DEBUG("Hit node %s on leaf traversal.  This is impossible!",
-                    kNodeTypeToString[curr->type].c_str());
+                    kNodeTypeToString[curr->node_type].c_str());
+          */
           assert(false);
         }
       }
     }
   }
 
-  void CollapseLeafData(__attribute__((unused))Node* node,__attribute__((unused)) std::vector<ValueType>& output) const {
+  void CollapseLeafData(Node* node, std::vector<ValueType>& output) const {
     assert(IsLeaf(node));
 
     // We use vectors here to track inserted key/value pairs.  Yes, lookups
@@ -636,12 +641,16 @@ class BWTree {
           break;
         }
         default: {
+          /*
           LOG_DEBUG("Hit node type %s when collapsing leaf data. This is bad.",
-                    kNodeTypeToString[curr->type].c_str());
+                    kNodeTypeToString[curr->node_type].c_str());
+          */
           assert(false);
         }
       }
     }
+
+    LOG_DEBUG("CollapseLeafData: Found %lu inserted, %lu deleted", inserted_keys.size(), deleted_keys.size());
 
     // curr now points to a true blue leaf node
     LeafNode* leaf = static_cast<LeafNode*>(curr);
@@ -649,11 +658,29 @@ class BWTree {
     std::vector<ValueType> all_vals{leaf->vals, leaf->vals + leaf->num_entries};
     if (stop_key != nullptr) {
       auto iter = std::lower_bound(all_keys.begin(), all_keys.end(), *stop_key, key_comparator_);
+      uint32_t index = all_keys.end() - iter;
       all_keys.erase(iter, all_keys.end());
+      all_vals.erase(all_vals.begin()+index, all_vals.end());
     }
 
     // Sort inserted, delete and all_keys/all_vals
     // Perform 3-way merge into output
+    for (uint32_t i = 0; i < inserted_keys.size(); i++) {
+      auto pos = std::lower_bound(all_keys.begin(), all_keys.end(), inserted_keys[i], key_comparator_);
+      uint32_t index = all_keys.end() - pos;
+      all_vals.insert(all_vals.begin() + index, inserted_vals[i]);
+    }
+
+    // TODO: Handle with duplicate keys
+    for (uint32_t i = 0; i < deleted_keys.size(); i++) {
+      auto pos = std::lower_bound(all_keys.begin(), all_keys.end(), deleted_keys[i], key_comparator_);
+      uint32_t index = all_keys.end() - pos;
+      all_vals.erase(all_vals.begin() + index);
+    }
+
+    for (uint32_t i = 0; i < all_vals.size(); i++) {
+      output.push_back(all_vals[i]);
+    }
   }
 
 
@@ -704,8 +731,10 @@ class BWTree {
         default: {
         // TODO: With single threading, nothing in the chain can be DeltaRemoveLeaf.
         // In multithreading, there might be some weird cases.
+        /*
           log_debug("hit node %s on insert.  this is impossible!",
-                    kNodeTypeToString[cur->type].c_str());
+                    kNodeTypeToString[cur->node_type].c_str());
+        */
           assert(false);
         }
       }
@@ -779,7 +808,7 @@ class BWTree {
   Node* GetRoot() const { return GetNode(root_pid_.load()); }
 
   // Is the given node a leaf node
-  bool IsLeaf(Node* node) const {
+  bool IsLeaf(const Node* node) const {
     switch (node->node_type) {
       case Node::NodeType::Leaf:
       case Node::NodeType::DeltaInsert:

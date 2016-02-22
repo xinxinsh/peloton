@@ -214,9 +214,11 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   class BWTreeIterator: public std::iterator<std::input_iterator_tag, ValueType> {
    public:
-    BWTreeIterator(uint32_t curr_idx, pid_t node_pid, Node* node,
-                   const std::vector<ValueType>&& collapsed_contents)
-        : curr_idx_(curr_idx),
+    BWTreeIterator(const BWTree<KeyType, ValueType, KeyComparator>& tree,
+                   uint32_t curr_idx, pid_t node_pid, Node* node,
+                   std::vector<ValueType>&& collapsed_contents)
+        : tree_(tree),
+          curr_idx_(curr_idx),
           node_pid_(node_pid),
           node_(node),
           collapsed_contents_(std::move(collapsed_contents)) {
@@ -230,19 +232,23 @@ class BWTree {
       } else {
         // We've exhausted this node, find the next
         Node* curr = node_;
-        while (curr->type != Node::NodeType::Leaf) {
+        while (curr->node_type != Node::NodeType::Leaf) {
           DeltaNode* delta = static_cast<DeltaNode*>(curr);
-          curr = curr->next;
+          curr = delta->next;
         }
         LeafNode* leaf = static_cast<LeafNode*>(curr);
         pid_t right_sibling = leaf->right_link;
         if (right_sibling == kInvalidPid) {
           // No more data
+          curr_idx_ = 0;
+          node_pid_ = kInvalidPid;
+          node_ = nullptr;
+          collapsed_contents_.clear();
         } else {
-          Node* right_node = GetNode(right_sibling);
+          Node* right_node = tree_.GetNode(right_sibling);
           collapsed_contents_.clear();
           assert(IsLeaf(right_node));
-          CollapseLeafData(right_node, collapsed_contents_);
+          tree_.CollapseLeafData(right_node, collapsed_contents_);
         }
       }
       return *this;
@@ -250,24 +256,32 @@ class BWTree {
 
     // Equality/Inequality checks
     bool operator==(const BWTreeIterator& other) const {
-      return node_ == other.node && curr_idx_ == other.curr_idx_;
+      return node_ == other.node_ && curr_idx_ == other.curr_idx_;
     }
 
     bool operator!=(const BWTreeIterator& other) const {
       return !(*this == other);
     }
 
+    ValueType operator*() const {
+      return data();
+    }
+
     // Access to the key the iterator points to
     KeyType key() const;
 
     // Access to the value the iterator points to
-    ValueType data() const;
+    ValueType data() const {
+      // TODO: Bounds check
+      return collapsed_contents_[curr_idx_];
+    }
 
    private:
+    const BWTree<KeyType, ValueType, KeyComparator>& tree_;
     uint32_t curr_idx_;
     pid_t node_pid_;
     Node* node_;
-    const std::vector<ValueType> collapsed_contents_;
+    std::vector<ValueType> collapsed_contents_;
   };
 
  public:
@@ -345,7 +359,7 @@ class BWTree {
       }
       base_leaf = node;
     }
-    return Iterator{result.slot_idx, result.node_pid, base_leaf, std::move(vals)};
+    return Iterator{*this, result.slot_idx, result.node_pid, base_leaf, std::move(vals)};
   }
 
   // C++ container iterator functions (hence, why they're not capitalized)
@@ -353,11 +367,12 @@ class BWTree {
     Node* leftmost_leaf = GetNode(leftmost_leaf_pid_);
     std::vector<ValueType> vals;
     CollapseLeafData(leftmost_leaf, vals);
-    return Iterator{0, leftmost_leaf_pid_, leftmost_leaf, std::move(vals)};
+    return Iterator{*this, 0, leftmost_leaf_pid_, leftmost_leaf, std::move(vals)};
   }
 
   Iterator end() const {
-    return Iterator{0, kInvalidPid, nullptr, {}};
+    std::vector<ValueType> empty;
+    return Iterator{*this, 0, kInvalidPid, nullptr, std::move(empty)};
   }
 
  private:

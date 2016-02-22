@@ -45,7 +45,7 @@ class MappingTable {
   }
 
   // Get the mapping for the provided key
-  ValueType Get(KeyType key) {
+  ValueType Get(KeyType key) const {
     auto* entry = EntryFor(key);
     return entry == nullptr ? nullptr : entry->val.load();
   }
@@ -83,7 +83,7 @@ class MappingTable {
   };
 
   // Get the entry for the provided key
-  Entry* EntryFor(KeyType& key) {
+  Entry* EntryFor(KeyType& key) const {
     // TODO: Check keys, perform second hash etc.
     uint64_t hash = HashFor(key);
     return table_[hash];

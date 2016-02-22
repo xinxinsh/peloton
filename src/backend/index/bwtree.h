@@ -218,7 +218,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   class BWTreeIterator: public std::iterator<std::input_iterator_tag, std::pair<KeyType, ValueType>> {
    public:
-    BWTreeIterator(const BWTree<KeyType, ValueType, KeyComparator>& tree,
+    BWTreeIterator(const BWTree<KeyType, ValueType, KeyComparator, ValueComparator>& tree,
                    uint32_t curr_idx, pid_t node_pid, Node* node,
                    std::vector<std::pair<KeyType, ValueType>>&& collapsed_contents)
         : tree_(tree),
@@ -283,7 +283,7 @@ class BWTree {
     }
 
    private:
-    const BWTree<KeyType, ValueType, KeyComparator>& tree_;
+    const BWTree<KeyType, ValueType, KeyComparator, ValueComparator>& tree_;
     uint32_t curr_idx_;
     pid_t node_pid_;
     Node* node_;
@@ -292,7 +292,7 @@ class BWTree {
 
  public:
   /// *** The public API
-  typedef typename BWTree<KeyType, ValueType, KeyComparator>::BWTreeIterator Iterator;
+  typedef typename BWTree<KeyType, ValueType, KeyComparator, ValueComparator>::BWTreeIterator Iterator;
   typedef typename std::multiset<std::pair<KeyType, ValueType>> KVMultiset;
   friend class BWTreeIterator;
 

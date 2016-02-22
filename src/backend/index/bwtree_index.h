@@ -31,11 +31,20 @@ namespace index {
  *
  * @see Index
  */
+
+class ItemPointerComparator {
+  public:
+  bool Compare(const ItemPointer x, const ItemPointer y) {
+    return (x.block == y.block) &&
+           (x.offset == y.offset);
+  }
+};
+
 template <typename KeyType, typename ValueType, class KeyComparator, class KeyEqualityChecker>
 class BWTreeIndex : public Index {
   friend class IndexFactory;
 
-  typedef BWTree<KeyType, ValueType, KeyComparator> MapType;
+  typedef BWTree<KeyType, ValueType, KeyComparator, ItemPointerComparator> MapType;
 
  public:
   BWTreeIndex(IndexMetadata *metadata);

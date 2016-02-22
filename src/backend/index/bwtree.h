@@ -33,7 +33,8 @@ namespace index {
 //===--------------------------------------------------------------------===//
 // The BW-Tree
 //===--------------------------------------------------------------------===//
-template <typename KeyType, typename ValueType, class KeyComparator>
+template <typename KeyType, typename ValueType, class KeyComparator,
+          class ValueComparator>
 class BWTree {
   typedef uint64_t pid_t;
   static const pid_t kInvalidPid = std::numeric_limits<pid_t>::max();
@@ -296,12 +297,13 @@ class BWTree {
   friend class BWTreeIterator;
 
   // Constructor
-  BWTree(KeyComparator comparator)
+  BWTree(KeyComparator keyComparator, ValueComparator valueComparator)
       : pid_allocator_(0),
         root_pid_(pid_allocator_++),
         leftmost_leaf_pid_(root_pid_.load()),
         rightmost_leaf_pid_(root_pid_.load()),
-        key_comparator_(comparator) {
+        key_comparator_(keyComparator),
+        value_comparator_(valueComparator) {
     // Create a new root page
     LeafNode* root = new LeafNode();
     root->node_type = Node::NodeType::Leaf;
@@ -338,6 +340,47 @@ class BWTree {
     if (num_entries > insert_branch_factor) {
       //Split(result.leaf_node, node_pid, deltaInsert);
     }
+  }
+
+  bool Delete(KeyType key, __attribute__((unused)) const ValueType value) {
+    // TODO: replace it with Search
+    FindDataNodeResult result = FindDataNode(key);
+    if (result.found != true)
+      return false;
+    Node *prevRoot = result.leaf_node;
+    auto num_entries = result.leaf_node->num_entries;
+    auto matched = false;
+    for (size_t prevRootValItr = 0; prevRootValItr != num_entries;
+         ++prevRootValItr) {
+      // TODO: do comparison
+      //if (leafPrevRoot->vals[prevRootValItr] == value)
+        //matched = true;
+    }
+    if (matched == false)
+      return false;
+
+    num_entries--;
+    if (result.head != nullptr) {
+      auto delta = static_cast<DeltaNode *>(result.head);
+      prevRoot = result.head;
+      num_entries = delta->num_entries;
+    }
+    // TODO: wrap in while loop for multi threaded cases
+    auto deltaDelete = new DeltaDelete();
+    deltaDelete->key = key;
+    // TODO: make this class into c++ initializer list
+    deltaDelete->node_type = Node::NodeType::DeltaDelete;
+    deltaDelete->next = prevRoot;
+    pid_t rootPid = result.node_pid;
+    while (!mapping_table_.Cas(rootPid, prevRoot, deltaDelete)) {
+      //TODO: need to retraverse in multithreading
+      prevRoot = mapping_table_.Get(rootPid);
+      deltaDelete->next = prevRoot;
+    }
+    if (num_entries < delete_branch_factor) {
+      //Merge(result.leaf_node, node_pid, deltaInsert);
+    }
+    return true;
   }
 
   // Return an iterator that points to the element that is associated with the
@@ -440,7 +483,7 @@ class BWTree {
     assert(node != nullptr);
     assert(!IsLeaf(node));
 
-    Node* curr_node = (Node*) node;
+    Node* curr_node = (Node *) node;
     while (true) {
       switch (curr_node->node_type) {
         case Node::NodeType::Inner: {
@@ -511,7 +554,7 @@ class BWTree {
   void FindInLeafNode(const Node* node, const KeyType key, FindDataNodeResult& result) const {
     assert(IsLeaf(node));
 
-    Node* curr = (Node*) node;
+    Node* curr = (Node *) node;
     while (true) {
       switch (curr->node_type) {
         case Node::NodeType::Leaf: {
@@ -854,8 +897,11 @@ class BWTree {
 
   // The comparator used for key comparison
   KeyComparator key_comparator_;
+  ValueComparator value_comparator_;
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
+  // TODO: just a randomly chosen number now...
+  int delete_branch_factor = 100;
 
   int insert_branch_factor = 500;
 };

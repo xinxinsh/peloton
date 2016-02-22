@@ -316,8 +316,12 @@ class BWTree {
   // Insertion
   void Insert(KeyType key, ValueType value) {
     FindDataNodeResult result = FindDataNode(key);
-    Node* prevRoot = result.leaf_node;
-    uint32_t num_entries = result.leaf_node->num_entries + 1;
+    Node* prevRoot = NULL;
+    uint32_t num_entries = 0;
+    if (result.leaf_node) {
+      prevRoot = result.leaf_node;
+      num_entries = result.leaf_node->num_entries + 1;
+    }
     if (result.head) {
       DeltaNode* delta = static_cast<DeltaNode*>(result.head);
       prevRoot = result.head;

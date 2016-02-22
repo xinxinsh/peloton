@@ -273,16 +273,24 @@ class BWTree {
  public:
   /// *** The public API
   typedef typename BWTree<KeyType, ValueType, KeyComparator>::BWTreeIterator Iterator;
-  typedef typename std::multiset<std::pair<KeyType, ValueType>> KVMultiset; 
+  typedef typename std::multiset<std::pair<KeyType, ValueType>> KVMultiset;
   friend class BWTreeIterator;
 
   // Constructor
   BWTree(KeyComparator comparator)
       : pid_allocator_(0),
         root_pid_(pid_allocator_++),
+        leftmost_leaf_pid_(root_pid_.load()),
+        rightmost_leaf_pid_(root_pid_.load()),
         key_comparator_(comparator) {
     // Create a new root page
-    Node* root = new LeafNode();
+    LeafNode* root = new LeafNode();
+    root->node_type = Node::NodeType::Leaf;
+    root->right_link = root->left_link = kInvalidPid;
+    root->num_entries = 0;
+    root->keys = nullptr;
+    root->vals = nullptr;
+    // Insert into mapping table
     mapping_table_.Insert(root_pid_, root);
   }
 
@@ -317,24 +325,40 @@ class BWTree {
   // provided key, or an iterator that is equal to what is returned by end()
   Iterator Search(const KeyType key) {
     FindDataNodeResult result = FindDataNode(key);
-    if (result.node == nullptr) {
+    if (!result.found) {
       // The key doesn't exist, return an invalid iterator
       return end();
     }
 
     // Collapse the chain+delta into a vector of values
+    assert(IsLeaf(result.head));
     std::vector<ValueType> vals;
-    Node* node = result.node;
-    if (node->node_type == Node::NodeType::Delta) {
-
+    CollapseLeafData(result.head, vals);
+    Node* base_leaf = nullptr;
+    if (result.leaf_node != nullptr) {
+      base_leaf = result.leaf_node;
+    } else {
+      Node* node = result.head;
+      while (node->node_type != Node::NodeType::Leaf) {
+        DeltaNode* delta = static_cast<DeltaNode*>(node);
+        node = delta->next;
+      }
+      base_leaf = node;
     }
-    return Iterator{0, result.node, vals};
+    return Iterator{result.slot_idx, result.node_pid, base_leaf, std::move(vals)};
   }
 
   // C++ container iterator functions (hence, why they're not capitalized)
-  Iterator begin() const;
+  Iterator begin() const {
+    Node* leftmost_leaf = GetNode(leftmost_leaf_pid_);
+    std::vector<ValueType> vals;
+    CollapseLeafData(leftmost_leaf, vals);
+    return Iterator{0, leftmost_leaf_pid_, leftmost_leaf, std::move(vals)};
+  }
 
-  Iterator end() const;
+  Iterator end() const {
+    return Iterator{0, kInvalidPid, nullptr, {}};
+  }
 
  private:
   // Private APIs
@@ -538,7 +562,7 @@ class BWTree {
     }
   }
 
-  void CollapseLeafData(const Node* node, std::vector<ValueType>& output) const {
+  void CollapseLeafData(__attribute__((unused))Node* node,__attribute__((unused)) std::vector<ValueType>& output) const {
     assert(IsLeaf(node));
 
     // We use vectors here to track inserted key/value pairs.  Yes, lookups
@@ -549,43 +573,51 @@ class BWTree {
     std::vector<ValueType> inserted_vals;
     std::vector<KeyType> deleted_keys;
 
-    bool check_stop = false;
-    KeyType stop;
+    struct Equals {
+      KeyComparator cmp;
+      KeyType key;
+      bool operator()(const KeyType& o) const {
+        return cmp(key, o) == 0;
+      }
+    };
+
+    KeyType* stop_key = nullptr;
     Node* curr = node;
-    while (curr->type != Node::NodeType::Leaf) {
-      switch (curr->type) {
+    while (curr->node_type != Node::NodeType::Leaf) {
+      switch (curr->node_type) {
         case Node::NodeType::DeltaInsert: {
           DeltaInsert* insert = static_cast<DeltaInsert*>(curr);
-          if (check_stop && key_comparator_(insert->key, stop) > 0) {
+          Equals equality{key_comparator_, insert->key};
+          if (stop_key != nullptr && key_comparator_(insert->key, *stop_key) > 0) {
             // There was a split and the key that this delta represents is actually
             // owned by another node.  We don't include it in our results
-          } else if (std::find(inserted_keys.begin(), inserted_keys.end(), insert->key) == inserted_keys.end()
-              && std::find(deleted_keys.begin(), deleted_keys.end(), insert->key) == deleted_keys.end()) {
+          } else if (std::find_if(inserted_keys.begin(), inserted_keys.end(), equality) == inserted_keys.end()
+              && std::find_if(deleted_keys.begin(), deleted_keys.end(), equality) == deleted_keys.end()) {
             inserted_keys.push_back(insert->key);
-            inserted_vals.push_back(insert->val);
+            inserted_vals.push_back(insert->value);
           }
           curr = insert->next;
           break;
         }
         case Node::NodeType::DeltaDelete: {
           DeltaDelete* del = static_cast<DeltaDelete*>(curr);
-          if (std::find(inserted_keys.begin(), inserted_keys.end(), curr->key) == inserted_keys.end()
-              && std::find(deleted_keys.begin(), deleted_keys.end(), curr->key) == deleted_keys.end()) {
-            deleted_keys.push_back(curr->key);
+          Equals equality{key_comparator_, del->key};
+          if (std::find_if(inserted_keys.begin(), inserted_keys.end(), equality) == inserted_keys.end()
+              && std::find_if(deleted_keys.begin(), deleted_keys.end(), equality) == deleted_keys.end()) {
+            deleted_keys.push_back(del->key);
           }
           curr = del->next;
           break;
         }
-        case Node::NodeType::Merge: {
+        case Node::NodeType::DeltaMerge: {
           DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
-          CollapseLeafData(GetNode(merge->new_right));
+          CollapseLeafData(GetNode(merge->new_right), output);
           curr = merge->next;
           break;
         }
-        case Node::NodeType::Split: {
+        case Node::NodeType::DeltaSplit: {
           DeltaSplit* split = static_cast<DeltaSplit*>(curr);
-          check_stop = true;
-          stop = split->split_key;
+          stop_key = &split->split_key;
           break;
         }
         default: {
@@ -595,16 +627,17 @@ class BWTree {
         }
       }
     }
+
     // curr now points to a true blue leaf node
     LeafNode* leaf = static_cast<LeafNode*>(curr);
-    std::vector<KeyType> all_keys { leaf->keys, leaf->keys + leaf->num_entries };
-    std::vector<ValueType> all_vals { leaf->vals, leaf->vals + leaf->num_entries };
-    if (check_stop) {
-      auto iter = std::lower_bound(all_keys.begin(), all_keys.end(), stop);
+    std::vector<KeyType> all_keys{leaf->keys, leaf->keys + leaf->num_entries};
+    std::vector<ValueType> all_vals{leaf->vals, leaf->vals + leaf->num_entries};
+    if (stop_key != nullptr) {
+      auto iter = std::lower_bound(all_keys.begin(), all_keys.end(), *stop_key, key_comparator_);
       all_keys.erase(iter, all_keys.end());
     }
 
-    // Sort inserted, delete and all_keys/all_vals 
+    // Sort inserted, delete and all_keys/all_vals
     // Perform 3-way merge into output
   }
 
@@ -651,7 +684,7 @@ class BWTree {
           // Keep traversing down the current chain.
           break;
         case Node::NodeType::Leaf: {
-          return getKVsAndCountLeaf(cur, kvs, deleted);    
+          return getKVsAndCountLeaf(cur, kvs, deleted);
         }
         default: {
         // TODO: With single threading, nothing in the chain can be DeltaRemoveLeaf.
@@ -696,14 +729,14 @@ class BWTree {
     right_sibling->num_entries = kv_split_vec.size();
     right_sibling->keys = &split_vec_keys[0];
     right_sibling->vals = &split_vec_values[0];
-      
+
     right_sibling->next = node;
     right_sibling->node_type = Node::NodeType::Leaf;
     pid_t sibling_pid = pid_allocator_++;
     mapping_table_.insert(sibling_pid, right_sibling);
     //TODO: what happens wit multithreading?
     leaf->right_link = sibling_pid;
-    
+
     DeltaSplit* delta_split = new DeltaSplit();
     delta_split->split_key = split_key;
     delta_split->new_right = sibling_pid;
@@ -711,7 +744,7 @@ class BWTree {
 
     //TODO: need to retraverse in multithreading;
     mapping_table_.Cas(leaf_pid, node, delta_split);
-    
+
     // Install index
     DeltaSplit* split_index = new DeltaSplit();
     split_index->node_type = Node::NodeType::DeltaSplitInner;
@@ -757,11 +790,25 @@ class BWTree {
 
   // The root of the tree
   std::atomic<pid_t> root_pid_;
+
+  // The left-most and right-mode leaf PIDs.  Tracking these essentially forms
+  // a linked list of leaves that we use for scans. The reason the leftmost
+  // PID is non-atomic while the rightmost is atomic is because of splits.
+  // Splits always create a new right node, leaving the left with the same PID.
+  // At index creation time, the leftmost is the root.  Splitting the root
+  // creates a new root, but the PID of left-most leaf's PID is the same.
+  //
+  // Similarily, the right-most leaf PID can change as a result of a split
+  // with the creation of a new node holding the values from the right-half
+  // of the split.
+  pid_t leftmost_leaf_pid_;
+  std::atomic<pid_t> rightmost_leaf_pid_;
+
   // The comparator used for key comparison
   KeyComparator key_comparator_;
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
- 
+
   int insert_branch_factor = 500;
 };
 

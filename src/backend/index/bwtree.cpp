@@ -17,36 +17,36 @@ namespace index {
 
 // Our map from NodeType => std::string for helpful error messages
 // Templates make this guy fugly
-template <typename KeyType, typename ValueType, class KeyComparator>
+template <typename KeyType, typename ValueType, class KeyComparator, class KeyEqualityChecker>
 const std::map<
-    typename BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType,
+    typename BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType,
     std::string> BWTree<KeyType, ValueType,
-                        KeyComparator>::kNodeTypeToString = {
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::Inner,
+                        KeyComparator, KeyEqualityChecker>::kNodeTypeToString = {
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::Inner,
      "InnerNode"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::Leaf,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::Leaf,
      "LeadNode"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaInsert,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaInsert,
      "Delta Insert"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaDelete,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaDelete,
      "Delta Delete"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaMerge,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaMerge,
      "Delta Merge"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaMergeInner,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaMergeInner,
      "Delta Merge Inner"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaSplit,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaSplit,
      "Delta Split"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaSplitInner,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaSplitInner,
      "Delta Split Inner"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaIndex,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaIndex,
      "Delta Index"},
     {BWTree<KeyType, ValueType,
-            KeyComparator>::Node::NodeType::DeltaDeleteIndex,
+            KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaDeleteIndex,
      "Delta Delete Index"},
-    {BWTree<KeyType, ValueType, KeyComparator>::Node::NodeType::DeltaRemoveLeaf,
+    {BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaRemoveLeaf,
      "Delta Remove Leaf Node"},
     {BWTree<KeyType, ValueType,
-            KeyComparator>::Node::NodeType::DeltaRemoveInner,
+            KeyComparator, KeyEqualityChecker>::Node::NodeType::DeltaRemoveInner,
      "Delta Remove Inner Node"}};
 
 }  // End index namespace

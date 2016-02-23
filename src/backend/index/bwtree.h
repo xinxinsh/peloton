@@ -33,7 +33,8 @@ namespace index {
 //===--------------------------------------------------------------------===//
 // The BW-Tree
 //===--------------------------------------------------------------------===//
-template <typename KeyType, typename ValueType, class KeyComparator>
+template <typename KeyType, typename ValueType, class KeyComparator,
+          class KeyEqualityChecker>
 class BWTree {
   typedef uint64_t pid_t;
   static const pid_t kInvalidPid = std::numeric_limits<pid_t>::max();
@@ -217,7 +218,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   class BWTreeIterator: public std::iterator<std::input_iterator_tag, std::pair<KeyType, ValueType>> {
    public:
-    BWTreeIterator(const BWTree<KeyType, ValueType, KeyComparator>& tree,
+    BWTreeIterator(const BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>& tree,
                    uint32_t curr_idx, pid_t node_pid, Node* node,
                    std::vector<std::pair<KeyType, ValueType>>&& collapsed_contents)
         : tree_(tree),
@@ -282,7 +283,7 @@ class BWTree {
     }
 
    private:
-    const BWTree<KeyType, ValueType, KeyComparator>& tree_;
+    const BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>& tree_;
     uint32_t curr_idx_;
     pid_t node_pid_;
     Node* node_;
@@ -291,17 +292,18 @@ class BWTree {
 
  public:
   /// *** The public API
-  typedef typename BWTree<KeyType, ValueType, KeyComparator>::BWTreeIterator Iterator;
+  typedef typename BWTree<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::BWTreeIterator Iterator;
   typedef typename std::multiset<std::pair<KeyType, ValueType>> KVMultiset;
   friend class BWTreeIterator;
 
   // Constructor
-  BWTree(KeyComparator comparator)
+  BWTree(KeyComparator comparator, KeyEqualityChecker equals)
       : pid_allocator_(0),
         root_pid_(pid_allocator_++),
         leftmost_leaf_pid_(root_pid_.load()),
         rightmost_leaf_pid_(root_pid_.load()),
-        key_comparator_(comparator) {
+        key_comparator_(comparator),
+        key_equals_(equals) {
     // Create a new root page
     LeafNode* root = new LeafNode();
     root->node_type = Node::NodeType::Leaf;
@@ -359,6 +361,14 @@ class BWTree {
     assert(IsLeaf(result.head));
     std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(result.head, vals);
+    uint32_t slot = 0;
+    for (uint32_t i = 0; i < vals.size(); i++) {
+      if (key_equals_(key, vals[i].first)) {
+        slot = i;
+        break;
+      }
+    }
+    LOG_DEBUG("Slot %d", slot);
     Node* base_leaf = nullptr;
     if (result.leaf_node != nullptr) {
       base_leaf = result.leaf_node;
@@ -370,7 +380,7 @@ class BWTree {
       }
       base_leaf = node;
     }
-    return Iterator{*this, result.slot_idx, result.node_pid, base_leaf, std::move(vals)};
+    return Iterator{*this, slot, result.node_pid, base_leaf, std::move(vals)};
   }
 
   // C++ container iterator functions (hence, why they're not capitalized)
@@ -863,6 +873,8 @@ class BWTree {
 
   // The comparator used for key comparison
   KeyComparator key_comparator_;
+  KeyEqualityChecker key_equals_;
+
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
 

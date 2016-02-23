@@ -65,6 +65,7 @@ BWTreeIndex<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::Scan(
 template <typename KeyType, typename ValueType, class KeyComparator, class KeyEqualityChecker>
 std::vector<ItemPointer>
 BWTreeIndex<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::ScanAllKeys() {
+  // Scan the entire tree
   std::vector<ItemPointer> result;
   for (auto entry : container) {
     result.push_back(entry.second);
@@ -82,29 +83,12 @@ BWTreeIndex<KeyType, ValueType, KeyComparator, KeyEqualityChecker>::ScanKey(cons
   KeyType index_key;
   index_key.SetFromKey(key);
 
-  // Get results
+  // Do search, iterating while the key is the one we want
   std::vector<ItemPointer> result;
-
-  // Do search
-  auto iter = container.Search(index_key);
-  while (true) {
-    if (iter == container.end()) {
-      break;
-    } else if (equals(iter.key(), index_key) == 0) {
-      break;
-    } else {
-      result.push_back(iter.data());
-    }
-    ++iter;
-  }
-
-  // TODO: Why doesn't the below work?
-  /*
   for (auto iter = container.Search(index_key), end = container.end();
-       iter != end && equals(iter.key(), index_key) == 0; ++iter) {
+       iter != end && equals(iter.key(), index_key); ++iter) {
     result.push_back(iter.data());
   }
-  */
 
   return result;
 }

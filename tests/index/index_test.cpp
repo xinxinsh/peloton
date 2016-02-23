@@ -97,10 +97,10 @@ TEST(IndexTests, BasicTest) {
   EXPECT_EQ(locations[0].block, item0.block);
 
   // DELETE
-  //index->DeleteEntry(key0.get(), item0);
+  index->DeleteEntry(key0.get(), item0);
 
-  //locations = index->ScanKey(key0.get());
-  //EXPECT_EQ(locations.size(), 0);
+  locations = index->ScanKey(key0.get());
+  EXPECT_EQ(locations.size(), 0);
 
   delete tuple_schema;
 }
@@ -229,7 +229,7 @@ TEST(IndexTests, DeleteTest) {
   // Single threaded test
   size_t scale_factor = 1;
   LaunchParallelTest(1, InsertTest, index.get(), pool, scale_factor);
-  //LaunchParallelTest(1, DeleteTest, index.get(), pool, scale_factor);
+  LaunchParallelTest(1, DeleteTest, index.get(), pool, scale_factor);
 
   // Checks
   std::unique_ptr<storage::Tuple> key0(new storage::Tuple(key_schema, true));

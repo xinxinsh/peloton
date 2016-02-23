@@ -348,16 +348,27 @@ class BWTree {
     }
   }
 
-  bool Delete(KeyType key, __attribute__((unused)) const ValueType value) {
-    // TODO: replace it with Search
+  bool Delete(KeyType key, const ValueType value) {
     FindDataNodeResult result = FindDataNode(key);
     if (result.found != true)
       return false;
+
     assert(IsLeaf(result.head));
+
+    Node *prevRoot = NULL;
+    uint32_t num_entries = 0;
+    if (result.leaf_node) {
+      prevRoot = result.leaf_node;
+      num_entries = result.leaf_node->num_entries - 1;
+    }
+    if (result.head) {
+      DeltaNode* delta = static_cast<DeltaNode*>(result.head);
+      prevRoot = result.head;
+      num_entries = delta->num_entries - 1;
+    }
+
     std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(result.head, vals);
-
-    Node *prevRoot = result.leaf_node;
 
     auto matched = false;
     for (auto val : vals) {
@@ -368,7 +379,6 @@ class BWTree {
     if (matched == false)
       return false;
 
-    auto num_entries = result.leaf_node->num_entries - 1;
     if (result.head != nullptr) {
       auto delta = static_cast<DeltaNode *>(result.head);
       prevRoot = result.head;

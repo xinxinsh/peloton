@@ -338,6 +338,8 @@ class BWTree {
       //TODO: need to retraverse in multithreading
       prevRoot = mapping_table_.Get(rootPid);
       deltaInsert->next = prevRoot;
+      failed_cas_++;
+      LOG_DEBUG("Failed to CAS in Insert");
     }
     if (num_entries > insert_branch_factor) {
       //Split(result.leaf_node, node_pid, deltaInsert);
@@ -590,6 +592,7 @@ class BWTree {
 
   void CollapseLeafData(Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
     assert(IsLeaf(node));
+    uint32_t chain_length = 0;
 
     // We use vectors here to track inserted key/value pairs.  Yes, lookups
     // here are O(n), but we don't expect delta chains to be all that long.
@@ -654,9 +657,11 @@ class BWTree {
           assert(false);
         }
       }
+      chain_length++;
     }
 
-    LOG_DEBUG("CollapseLeafData: Found %lu inserted, %lu deleted", inserted_keys.size(), deleted_keys.size());
+    LOG_DEBUG("CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d",
+              inserted_keys.size(), deleted_keys.size(), chain_length + 1);
 
     // curr now points to a true blue leaf node
     LeafNode* leaf = static_cast<LeafNode*>(curr);
@@ -862,6 +867,8 @@ class BWTree {
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
 
   int insert_branch_factor = 500;
+
+  std::atomic<uint64_t> failed_cas_;
 };
 
 }  // End index namespace

@@ -34,7 +34,7 @@ namespace index {
 
 class ItemPointerComparator {
   public:
-  bool Compare(const ItemPointer x, const ItemPointer y) {
+  bool Compare(const ItemPointer x, const ItemPointer y) const {
     return (x.block == y.block) &&
            (x.offset == y.offset);
   }

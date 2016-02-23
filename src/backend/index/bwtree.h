@@ -325,6 +325,7 @@ class BWTree {
     FindDataNodeResult result = FindDataNode(key);
     Node* prevRoot = NULL;
     uint32_t num_entries = 0;
+    std::vector<std::pair<KeyType, ValueType>> vals;
     if (result.leaf_node) {
       prevRoot = result.leaf_node;
       num_entries = result.leaf_node->num_entries + 1;
@@ -333,7 +334,17 @@ class BWTree {
       DeltaNode* delta = static_cast<DeltaNode*>(result.head);
       prevRoot = result.head;
       num_entries = delta->num_entries;
+      CollapseLeafData(result.head, vals);
     }
+
+    // CHeck for key and value equality here
+    auto matched = false;
+    for (auto val : vals) {
+      if (key_equals_(key, val.first) && value_comparator_.Compare(val.second, value))
+        matched = true;
+    }
+    if (matched) return;
+
     //TODO If remove, goto left sibling and insert there in multithreading case
     DeltaInsert* deltaInsert = new DeltaInsert();
     deltaInsert->key = key; deltaInsert->value = value;
@@ -377,7 +388,7 @@ class BWTree {
 
     auto matched = false;
     for (auto val : vals) {
-      if (value_comparator_.Compare(val.second, value))
+      if (key_equals_(key, val.first) && value_comparator_.Compare(val.second, value))
         matched = true;
     }
 
@@ -392,6 +403,7 @@ class BWTree {
     // TODO: wrap in while loop for multi threaded cases
     auto deltaDelete = new DeltaDelete();
     deltaDelete->key = key;
+    deltaDelete->value = value;
     // TODO: make this class into c++ initializer list
     deltaDelete->node_type = Node::NodeType::DeltaDelete;
     deltaDelete->next = prevRoot;
@@ -404,6 +416,7 @@ class BWTree {
     if (num_entries < delete_branch_factor) {
       //Merge(result.leaf_node, node_pid, deltaInsert);
     }
+    LOG_DEBUG("Inserted delta delete to node %lu", rootPid);
     return true;
   }
 
@@ -604,7 +617,7 @@ class BWTree {
         case Node::NodeType::DeltaInsert: {
           // Check if the inserted key is what we're looking for
           DeltaInsert* insert = static_cast<DeltaInsert*>(curr);
-          if (key_comparator_(key, insert->key) == 0) {
+          if (key_equals_(key, insert->key)) {
             // The insert was for the key we're looking for
             result.found = true;
             result.slot_idx = 0;
@@ -618,11 +631,12 @@ class BWTree {
         case Node::NodeType::DeltaDelete: {
           // Check if the key we're looking for has been deleted
           DeltaDelete* del = static_cast<DeltaDelete*>(curr);
-          if (key_comparator_(key, del->key) == 0) {
+          if (key_equals_(key, del->key)) {
             // The key/value was deleted
+            result.head = (Node*) node; 
             result.found = false;
             result.slot_idx = 0;
-            result.delta_node = nullptr;
+            result.delta_node = del;
             result.leaf_node = nullptr;
             return;
           }
@@ -667,15 +681,16 @@ class BWTree {
     // here are O(n), but we don't expect delta chains to be all that long.
     // These should fit nicely in CPU caches making linear lookups pretty
     // fast.
-    std::vector<KeyType> inserted_keys;
-    std::vector<ValueType> inserted_vals;
-    std::vector<KeyType> deleted_keys;
+    std::vector<std::pair<KeyType, ValueType>> inserted;
+    std::vector<std::pair<KeyType, ValueType>> deleted;
 
     struct Equals {
-      KeyComparator cmp;
+      KeyEqualityChecker key_equals;
+      ValueComparator val_comp;
       KeyType key;
-      bool operator()(const KeyType& o) const {
-        return cmp(key, o) == 0;
+      ValueType val;
+      bool operator()(const std::pair<KeyType, ValueType>& o) const {
+        return key_equals(key, o.first) && val_comp.Compare(val, o.second);
       }
     };
 
@@ -685,24 +700,23 @@ class BWTree {
       switch (curr->node_type) {
         case Node::NodeType::DeltaInsert: {
           DeltaInsert* insert = static_cast<DeltaInsert*>(curr);
-          Equals equality{key_comparator_, insert->key};
+          Equals equality{key_equals_, value_comparator_, insert->key, insert->value};
           if (stop_key != nullptr && key_comparator_(insert->key, *stop_key) > 0) {
             // There was a split and the key that this delta represents is actually
             // owned by another node.  We don't include it in our results
-          } else if (std::find_if(inserted_keys.begin(), inserted_keys.end(), equality) == inserted_keys.end()
-              && std::find_if(deleted_keys.begin(), deleted_keys.end(), equality) == deleted_keys.end()) {
-            inserted_keys.push_back(insert->key);
-            inserted_vals.push_back(insert->value);
+          } else if (std::find_if(inserted.begin(), inserted.end(), equality) == inserted.end()
+              && std::find_if(deleted.begin(), deleted.end(), equality) == deleted.end()) {
+            inserted.push_back(std::make_pair(insert->key, insert->value));
           }
           curr = insert->next;
           break;
         }
         case Node::NodeType::DeltaDelete: {
           DeltaDelete* del = static_cast<DeltaDelete*>(curr);
-          Equals equality{key_comparator_, del->key};
-          if (std::find_if(inserted_keys.begin(), inserted_keys.end(), equality) == inserted_keys.end()
-              && std::find_if(deleted_keys.begin(), deleted_keys.end(), equality) == deleted_keys.end()) {
-            deleted_keys.push_back(del->key);
+          Equals equality{key_equals_, value_comparator_, del->key, del->value};
+          if (std::find_if(inserted.begin(), inserted.end(), equality) == inserted.end()
+              && std::find_if(deleted.begin(), deleted.end(), equality) == deleted.end()) {
+            deleted.push_back(std::make_pair(del->key, del->value));
           }
           curr = del->next;
           break;
@@ -730,38 +744,53 @@ class BWTree {
     }
 
     LOG_DEBUG("CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d",
-              inserted_keys.size(), deleted_keys.size(), chain_length + 1);
+              inserted.size(), deleted.size(), chain_length + 1);
 
     // curr now points to a true blue leaf node
     LeafNode* leaf = static_cast<LeafNode*>(curr);
-    std::vector<KeyType> all_keys{leaf->keys, leaf->keys + leaf->num_entries};
-    std::vector<ValueType> all_vals{leaf->vals, leaf->vals + leaf->num_entries};
+    std::vector<std::pair<KeyType, ValueType>> all;
+    for (uint32_t i = 0; i < leaf->num_entries; i++) {
+      all.push_back(std::make_pair(leaf->keys[i], leaf->vals[i]));
+    }
+    /*
     if (stop_key != nullptr) {
       auto iter = std::lower_bound(all_keys.begin(), all_keys.end(), *stop_key, key_comparator_);
       uint32_t index = all_keys.end() - iter;
       all_keys.erase(iter, all_keys.end());
       all_vals.erase(all_vals.begin()+index, all_vals.end());
     }
+    */
 
-    // Sort inserted, delete and all_keys/all_vals
-    // Perform 3-way merge into output
-    for (uint32_t i = 0; i < inserted_keys.size(); i++) {
-      auto pos = std::lower_bound(all_keys.begin(), all_keys.end(), inserted_keys[i], key_comparator_);
-      uint32_t index = all_keys.end() - pos;
-      all_keys.insert(all_keys.begin() + index, inserted_keys[i]);
-      all_vals.insert(all_vals.begin() + index, inserted_vals[i]);
+    LOG_DEBUG("Size before insertions and deletes: %lu", all.size());
+
+    struct KeyComp2 {
+      KeyComparator cmp;
+      bool operator()(const std::pair<KeyType, ValueType>& first, const std::pair<KeyType, ValueType>& second) const {
+        return cmp(first.first, second.first);
+      }
+    };
+
+    KeyComp2 cmp { key_comparator_ };
+    for (uint32_t i = 0; i < inserted.size(); i++) {
+      auto pos = std::lower_bound(all.begin(), all.end(), inserted[i], cmp);
+      uint32_t index = all.end() - pos;
+      all.insert(all.begin() + index, inserted[i]);
     }
+
+    LOG_DEBUG("Keys size after insertion: %lu", all.size());
 
     // TODO: Handle with duplicate keys
-    for (uint32_t i = 0; i < deleted_keys.size(); i++) {
-      auto pos = std::lower_bound(all_keys.begin(), all_keys.end(), deleted_keys[i], key_comparator_);
-      uint32_t index = all_keys.end() - pos;
-      all_keys.erase(all_keys.begin() + index);
-      all_vals.erase(all_vals.begin() + index);
+    for (uint32_t i = 0; i < deleted.size(); i++) {
+      auto pos = std::lower_bound(all.begin(), all.end(), deleted[i], cmp);
+      uint32_t index = all.end() - pos;
+      LOG_DEBUG("Deleting entry %d", index);
+      all.erase(all.begin() + index);
     }
 
-    for (uint32_t i = 0; i < all_vals.size(); i++) {
-      output.push_back(std::make_pair(all_keys[i],all_vals[i]));
+    LOG_DEBUG("Keys size after delete: %lu", all.size());
+
+    for (uint32_t i = 0; i < all.size(); i++) {
+      output.push_back(all[i]);
     }
   }
 

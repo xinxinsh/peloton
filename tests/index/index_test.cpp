@@ -210,8 +210,8 @@ void DeleteTest(index::Index *index, VarlenPool *pool, size_t scale_factor){
         "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"), pool);
 
     // DELETE
-    index->DeleteEntry(key0.get(), item0);
     index->DeleteEntry(key1.get(), item1);
+    index->DeleteEntry(key0.get(), item0);
     index->DeleteEntry(key2.get(), item2);
     index->DeleteEntry(key3.get(), item1);
     index->DeleteEntry(key4.get(), item1);

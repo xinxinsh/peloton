@@ -347,19 +347,22 @@ class BWTree {
     FindDataNodeResult result = FindDataNode(key);
     if (result.found != true)
       return false;
+    assert(IsLeaf(result.head));
+    std::vector<std::pair<KeyType, ValueType>> vals;
+    CollapseLeafData(result.head, vals);
+
     Node *prevRoot = result.leaf_node;
-    auto num_entries = result.leaf_node->num_entries;
+
     auto matched = false;
-    for (size_t prevRootValItr = 0; prevRootValItr != num_entries;
-         ++prevRootValItr) {
-      // TODO: do comparison
-      //if (leafPrevRoot->vals[prevRootValItr] == value)
-        //matched = true;
+    for (auto val : vals) {
+      if (value_comparator_.Compare(val.second, value))
+        matched = true;
     }
+
     if (matched == false)
       return false;
 
-    num_entries--;
+    auto num_entries = result.leaf_node->num_entries - 1;
     if (result.head != nullptr) {
       auto delta = static_cast<DeltaNode *>(result.head);
       prevRoot = result.head;

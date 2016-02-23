@@ -424,21 +424,29 @@ class BWTree {
   // provided key, or an iterator that is equal to what is returned by end()
   Iterator Search(const KeyType key) {
     FindDataNodeResult result = FindDataNode(key);
+    /*
     if (!result.found) {
       // The key doesn't exist, return an invalid iterator
       return end();
     }
+    */
 
     // Collapse the chain+delta into a vector of values
     assert(IsLeaf(result.head));
     std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(result.head, vals);
+    bool found = false;
     uint32_t slot = 0;
     for (uint32_t i = 0; i < vals.size(); i++) {
       if (key_equals_(key, vals[i].first)) {
         slot = i;
+        found = true;
         break;
       }
+    }
+    if (!found) {
+      // The key doesn't exist, return an invalid iterator
+      return end();
     }
     LOG_DEBUG("Slot %d", slot);
     Node* base_leaf = nullptr;
@@ -633,7 +641,7 @@ class BWTree {
           DeltaDelete* del = static_cast<DeltaDelete*>(curr);
           if (key_equals_(key, del->key)) {
             // The key/value was deleted
-            result.head = (Node*) node; 
+            result.head = (Node*) node;
             result.found = false;
             result.slot_idx = 0;
             result.delta_node = del;
@@ -674,7 +682,9 @@ class BWTree {
   }
 
   void CollapseLeafData(Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
+    assert(node != nullptr);
     assert(IsLeaf(node));
+    output.clear();
     uint32_t chain_length = 0;
 
     // We use vectors here to track inserted key/value pairs.  Yes, lookups
@@ -783,8 +793,9 @@ class BWTree {
     for (uint32_t i = 0; i < deleted.size(); i++) {
       auto pos = std::lower_bound(all.begin(), all.end(), deleted[i], cmp);
       uint32_t index = all.end() - pos;
-      LOG_DEBUG("Deleting entry %d", index);
-      all.erase(all.begin() + index);
+      if (index < all.size()) {
+        all.erase(all.begin() + index);
+      }
     }
 
     LOG_DEBUG("Keys size after delete: %lu", all.size());

@@ -18,16 +18,14 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
-#include <iterator>
 #include <functional>
-#include <set>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <stack>
-#include <vector>
-#include <atomic>
-#include <cstdint>
+#include <set>
 #include <type_traits>
+#include <vector>
 
 namespace peloton {
 namespace index {
@@ -776,7 +774,7 @@ class BWTree {
         }
         case Node::NodeType::DeltaMerge: {
           DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
-          if (key_comparator_(key, merge->merge_key) < 0) {
+          if (key_comparator_(key, merge->merge_key)) {
             // The key is still in this logical node
             curr = merge->next;
           } else {
@@ -786,7 +784,7 @@ class BWTree {
         }
         case Node::NodeType::DeltaSplit: {
           DeltaSplit* split = static_cast<DeltaSplit*>(curr);
-          if (key_comparator_(key, split->split_key) < 0) {
+          if (key_comparator_(key, split->split_key)) {
             curr = split->next;
           } else {
             curr = GetNode(split->new_right);
@@ -794,10 +792,8 @@ class BWTree {
           break;
         }
         default: {
-          /*
           LOG_DEBUG("Hit node %s on leaf traversal.  This is impossible!",
-                    kNodeTypeToString[curr->node_type].c_str());
-          */
+                    std::to_string(curr->node_type).c_str());
           assert(false);
         }
       }
@@ -807,7 +803,6 @@ class BWTree {
   void CollapseLeafData(Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
     assert(node != nullptr);
     assert(IsLeaf(node));
-    output.clear();
     uint32_t chain_length = 0;
 
     // We use vectors here to track inserted key/value pairs.  Yes, lookups
@@ -869,46 +864,47 @@ class BWTree {
 
     // curr now points to a true blue leaf node
     LeafNode* leaf = static_cast<LeafNode*>(curr);
-    std::vector<std::pair<KeyType, ValueType>> all;
+    KeyOnlyComparator cmp{key_comparator_};
+
+    // Put all leaf data into the output vector
+    output.clear();
     for (uint32_t i = 0; i < leaf->num_entries; i++) {
-      all.push_back(std::make_pair(leaf->keys[i], leaf->vals[i]));
+      output.push_back(std::make_pair(leaf->keys[i], leaf->vals[i]));
     }
+
+    // Remove all entries that have been split away from this node
     /*
     if (stop_key != nullptr) {
-      auto iter = std::lower_bound(all_keys.begin(), all_keys.end(), *stop_key, key_comparator_);
-      uint32_t index = all_keys.end() - iter;
-      all_keys.erase(iter, all_keys.end());
-      all_vals.erase(all_vals.begin()+index, all_vals.end());
+      LOG_DEBUG("Collapsed size before removing split data: %lu", output.size());
+      auto iter = std::lower_bound(output.begin(), output.end(), *stop_key, cmp);
+      uint32_t index = output.end() - iter;
+      assert(index < output.size());
+      output.erase(iter, output.end());
     }
     */
 
-    LOG_DEBUG("Size before insertions and deletes: %lu", all.size());
+    LOG_DEBUG("Collapsed size before insertions and deletes: %lu", output.size());
 
-    KeyOnlyComparator cmp{key_comparator_};
+    // Add inserted key-value pairs from the delta chain
     for (uint32_t i = 0; i < inserted.size(); i++) {
-      auto pos = std::lower_bound(all.begin(), all.end(), inserted[i], cmp);
-      uint32_t index = all.end() - pos;
-      all.insert(all.begin() + index, inserted[i]);
+      auto pos = std::lower_bound(output.begin(), output.end(), inserted[i], cmp);
+      uint32_t index = output.end() - pos;
+      output.insert(output.begin() + index, inserted[i]);
     }
 
-    LOG_DEBUG("Keys size after insertion: %lu", all.size());
+    LOG_DEBUG("Collapsed size after insertions: %lu", output.size());
 
-    // TODO: Handle with duplicate keys
+    // Remove deleted key-value pairs from the delta chain
     for (uint32_t i = 0; i < deleted.size(); i++) {
-      auto pos = std::lower_bound(all.begin(), all.end(), deleted[i], cmp);
-      uint32_t index = all.end() - pos;
-      if (index < all.size()) {
-        all.erase(all.begin() + index);
+      auto pos = std::lower_bound(output.begin(), output.end(), deleted[i], cmp);
+      uint32_t index = output.end() - pos;
+      if (index < output.size()) {
+        output.erase(output.begin() + index);
       }
     }
 
-    LOG_DEBUG("Keys size after delete: %lu", all.size());
-
-    for (uint32_t i = 0; i < all.size(); i++) {
-      output.push_back(all[i]);
-    }
+    LOG_DEBUG("Final collapsed contents size after deletes: %lu", output.size());
   }
-
 
   // For Insert
   // template <typename KeyType, typename ValueType, class KeyComparator>

@@ -301,6 +301,39 @@ class BWTree {
     std::stack<pid_t> traversal_path;
   };
 
+
+  //===--------------------------------------------------------------------===//
+  // A functor that is able to match a given key-value pair in a collection
+  // of std::pair<KeyType, ValueType>
+  //===--------------------------------------------------------------------===//
+  struct KeyValueEquality {
+    // The key and equality checkers
+    KeyEqualityChecker key_equals;
+    ValueComparator val_comp;
+    // The key and value we're searching for
+    KeyType key;
+    ValueType val;
+
+    bool operator()(const std::pair<KeyType, ValueType>& o) const {
+      return key_equals(key, o.first) && val_comp.Compare(val, o.second);
+    }
+  };
+
+  //===--------------------------------------------------------------------===//
+  // A functor that is able to compare only the keys of two
+  // std::pair<KeyType, ValueType> types.  We use this to perform binary
+  // searches over collections of key-value pairs.
+  //===--------------------------------------------------------------------===//
+  struct KeyOnlyComparator {
+    // The comparator
+    KeyComparator cmp;
+
+    bool operator()(const std::pair<KeyType, ValueType>& first,
+                    const std::pair<KeyType, ValueType>& second) const {
+      return cmp(first.first, second.first);
+    }
+  };
+
  public:
   //===--------------------------------------------------------------------===//
   // Our STL iterator over the tree.  We use this guy for both forward and
@@ -784,23 +817,13 @@ class BWTree {
     std::vector<std::pair<KeyType, ValueType>> inserted;
     std::vector<std::pair<KeyType, ValueType>> deleted;
 
-    struct Equals {
-      KeyEqualityChecker key_equals;
-      ValueComparator val_comp;
-      KeyType key;
-      ValueType val;
-      bool operator()(const std::pair<KeyType, ValueType>& o) const {
-        return key_equals(key, o.first) && val_comp.Compare(val, o.second);
-      }
-    };
-
     KeyType* stop_key = nullptr;
     Node* curr = node;
     while (curr->node_type != Node::NodeType::Leaf) {
       switch (curr->node_type) {
         case Node::NodeType::DeltaInsert: {
           DeltaInsert* insert = static_cast<DeltaInsert*>(curr);
-          Equals equality{key_equals_, value_comparator_, insert->key, insert->value};
+          KeyValueEquality equality{key_equals_, value_comparator_, insert->key, insert->value};
           if (stop_key != nullptr && key_comparator_(insert->key, *stop_key) > 0) {
             // There was a split and the key that this delta represents is actually
             // owned by another node.  We don't include it in our results
@@ -813,7 +836,7 @@ class BWTree {
         }
         case Node::NodeType::DeltaDelete: {
           DeltaDelete* del = static_cast<DeltaDelete*>(curr);
-          Equals equality{key_equals_, value_comparator_, del->key, del->value};
+          KeyValueEquality equality{key_equals_, value_comparator_, del->key, del->value};
           if (std::find_if(inserted.begin(), inserted.end(), equality) == inserted.end()
               && std::find_if(deleted.begin(), deleted.end(), equality) == deleted.end()) {
             deleted.push_back(std::make_pair(del->key, del->value));
@@ -833,10 +856,8 @@ class BWTree {
           break;
         }
         default: {
-          /*
           LOG_DEBUG("Hit node type %s when collapsing leaf data. This is bad.",
-                    kNodeTypeToString[curr->node_type].c_str());
-          */
+                    std::to_string(curr->node_type).c_str());
           assert(false);
         }
       }
@@ -863,14 +884,7 @@ class BWTree {
 
     LOG_DEBUG("Size before insertions and deletes: %lu", all.size());
 
-    struct KeyComp2 {
-      KeyComparator cmp;
-      bool operator()(const std::pair<KeyType, ValueType>& first, const std::pair<KeyType, ValueType>& second) const {
-        return cmp(first.first, second.first);
-      }
-    };
-
-    KeyComp2 cmp { key_comparator_ };
+    KeyOnlyComparator cmp{key_comparator_};
     for (uint32_t i = 0; i < inserted.size(); i++) {
       auto pos = std::lower_bound(all.begin(), all.end(), inserted[i], cmp);
       uint32_t index = all.end() - pos;

@@ -824,25 +824,32 @@ class BWTree {
       switch (curr->node_type) {
         case Node::NodeType::DeltaInsert: {
           DeltaInsert* insert = static_cast<DeltaInsert*>(curr);
-          KeyValueEquality equality{key_equals_, value_comparator_, insert->key,
-                                    insert->value};
-          if (stop_key != nullptr &&
-              key_comparator_(insert->key, *stop_key) > 0) {
-            // There was a split and the key that this delta represents is actually
-            // owned by another node.  We don't include it in our results
-          } else if (std::find_if(inserted.begin(), inserted.end(), equality) == inserted.end()
-              && std::find_if(deleted.begin(), deleted.end(), equality) == deleted.end()) {
-            inserted.push_back(std::make_pair(insert->key, insert->value));
+          // If there was a previous split node and the delta insert is for a
+          // key that belongs to the right-half, we don't consider it an
+          // entry in this logical node. It is part this node's right sibling
+          if (stop_key == nullptr || key_comparator_(insert->key, *stop_key)) {
+            KeyValueEquality kv_equals{key_equals_, value_comparator_,
+                                       insert->key, insert->value};
+            if (std::find_if(deleted.begin(), deleted.end(), kv_equals) ==
+                    deleted.end()) {
+              // If this key wasn't previously deleted, it's an insert we need
+              // to track
+              inserted.push_back(std::make_pair(insert->key, insert->value));
+            }
           }
           curr = insert->next;
           break;
         }
         case Node::NodeType::DeltaDelete: {
           DeltaDelete* del = static_cast<DeltaDelete*>(curr);
-          KeyValueEquality equality{key_equals_, value_comparator_, del->key,
-                                    del->value};
-          if (std::find_if(inserted.begin(), inserted.end(), equality) == inserted.end()
-              && std::find_if(deleted.begin(), deleted.end(), equality) == deleted.end()) {
+          KeyValueEquality kv_equals{key_equals_, value_comparator_, del->key,
+                                     del->value};
+          // If this deleted key wasn't previously inserted or deleted, we
+          // actually need to delete it
+          if (std::find_if(inserted.begin(), inserted.end(), kv_equals) ==
+                  inserted.end() &&
+              std::find_if(deleted.begin(), deleted.end(), kv_equals) ==
+                  deleted.end()) {
             deleted.push_back(std::make_pair(del->key, del->value));
           }
           curr = del->next;
@@ -905,13 +912,14 @@ class BWTree {
 
     // Remove deleted key-value pairs from the delta chain
     for (uint32_t i = 0; i < deleted.size(); i++) {
-      auto pos =
-          std::lower_bound(output.begin(), output.end(), deleted[i], cmp);
-      if (pos != output.end()) {
+      auto range =
+          std::equal_range(output.begin(), output.end(), deleted[i].first, cmp);
+      for (auto pos = range.first, end = range.second; pos != end; ++pos) {
         std::pair<KeyType, ValueType> key_value = *pos;
-        if (AreEqual(key_value.first, deleted[i].first) &&
-            AreEqual(key_value.second, deleted[i].second)) {
+        if (EqualKeys(key_value.first, deleted[i].first) &&
+            EqualValues(key_value.second, deleted[i].second)) {
           output.erase(pos);
+          break;
         }
       }
     }
@@ -919,12 +927,12 @@ class BWTree {
     LOG_DEBUG("Final collapsed contents size after deletes: %lu",
               output.size());
 #ifndef NDEBUG
+    // Make sure the output is sorted by keys and contains no duplicate
+    // key-value pairs
     assert(std::is_sorted(output.begin(), output.end(), cmp));
     for (uint32_t i = 1; i < output.size(); i++) {
-      if (key_equals_(output[i-1].first, output[i].first)) {
-        assert(
-            !value_comparator_.Compare(output[i-1].second, output[i].second));
-      }
+      assert(key_comparator_(output[i-1].first, output[i].first) ||
+             !value_comparator_.Compare(output[i-1].second, output[i].second));
     }
 #endif
   }
@@ -974,12 +982,10 @@ class BWTree {
           return getKVsAndCountLeaf(cur, kvs, deleted);
         }
         default: {
-        // TODO: With single threading, nothing in the chain can be DeltaRemoveLeaf.
-        // In multithreading, there might be some weird cases.
-        /*
-          log_debug("hit node %s on insert.  this is impossible!",
-                    kNodeTypeToString[cur->node_type].c_str());
-        */
+          // TODO: With single threading, nothing in the chain can be DeltaRemoveLeaf.
+          // In multithreading, there might be some weird cases.
+          LOG_DEBUG("hit node %s on insert.  this is impossible!",
+                    std::to_string(cur->node_type).c_str());
           assert(false);
         }
       }
@@ -1078,12 +1084,12 @@ class BWTree {
   }
 
   // Check if two keys are equal
-  bool AreEqual(KeyType k1, KeyType k2) const {
+  bool EqualKeys(KeyType k1, KeyType k2) const {
     return key_equals_(k1, k2);
   }
 
   // Check if two values are equal
-  bool AreEqual(ValueType v1, ValueType v2) const {
+  bool EqualValues(ValueType v1, ValueType v2) const {
     return value_comparator_.Compare(v1, v2);
   }
 

@@ -180,6 +180,12 @@ class BWTree {
     //   pid_t child_pid;
     // }* entries;
     // This allows us to unify inner and leaf node types and simplify code
+
+    ~DataNode() {
+      if (keys != nullptr) {
+        delete[] keys;
+      }
+    }
   };
 
   //===--------------------------------------------------------------------===//
@@ -188,6 +194,27 @@ class BWTree {
   struct InnerNode : public DataNode {
     // The (contiguous) array of child PID links
     pid_t* children;
+
+    ~InnerNode() {
+      if (children != nullptr) {
+        delete[] children;
+      }
+    }
+
+    static InnerNode* Create(KeyType low_key, KeyType high_key,
+                             pid_t right_link, pid_t left_link,
+                             uint32_t num_entries) {
+      LeafNode* inner = new InnerNode();
+      inner->node_type = Node::NodeType::Inner;
+      inner->low_key = low_key;
+      inner->high_key = high_key;
+      inner->right_link = right_link;
+      inner->left_link = left_link;
+      inner->num_entries = num_entries;
+      inner->keys = new KeyType[num_entries];
+      inner->children = new pid_t[num_entries];
+      return inner;
+    }
   };
 
   //===--------------------------------------------------------------------===//
@@ -196,6 +223,27 @@ class BWTree {
   struct LeafNode : public DataNode {
     // The (contiguous) array of values
     ValueType* vals;
+
+    ~LeafNode() {
+      if (vals != nullptr) {
+        delete[] vals;
+      }
+    }
+
+    static LeafNode* Create(KeyType& low_key, KeyType& high_key,
+                            pid_t right_link, pid_t left_link,
+                            uint32_t num_entries) {
+      LeafNode* leaf = new LeafNode();
+      leaf->node_type = Node::NodeType::Leaf;
+      leaf->low_key = low_key;
+      leaf->high_key = high_key;
+      leaf->right_link = right_link;
+      leaf->left_link = left_link;
+      leaf->num_entries = num_entries;
+      leaf->keys = new KeyType[num_entries];
+      leaf->vals = new ValueType[num_entries];
+      return leaf;
+    }
   };
 
   //===--------------------------------------------------------------------===//
@@ -284,21 +332,21 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct FindDataNodeResult {
     // Was a value found
-    bool found;
+    bool found = false;
     // The slot to find the value
-    uint32_t slot_idx;
+    uint32_t slot_idx = 0;
     // The PID of the leaf node that contains the value
-    pid_t node_pid;
+    pid_t node_pid = kInvalidPid;
     // The head (root) of the delta chain (if one exists)
-    Node* head;
+    Node* head = nullptr;
     // The data was either found in the leaf node or a delta node.  Only one of
     // the following two pointers should be non-null if found is true.
-    DeltaNode* delta_node;
-    LeafNode* leaf_node;
+    DeltaNode* delta_node = nullptr;
+    LeafNode* leaf_node = nullptr;
     // The path the search took
     std::stack<pid_t> traversal_path;
     // The PID of the first node we find while traversal that needs consolidation
-    pid_t needs_consolidation;
+    pid_t needs_consolidation = kInvalidPid;
   };
 
 
@@ -497,13 +545,16 @@ class BWTree {
       // TODO: need to retraverse in multithreading
       prev_root = mapping_table_.Get(root_pid);
       delta_insert->next = prev_root;
-      failed_cas_++;
+      num_failed_cas_++;
     }
 
     LOG_DEBUG("Inserted new index entry");
 
     if (num_entries > insert_branch_factor) {
       // Split(result.leaf_node, node_pid, delta_insert);
+    }
+    if (result.needs_consolidation != kInvalidPid) {
+      ConsolidateNode(result.needs_consolidation);
     }
 
     return true;
@@ -613,9 +664,12 @@ class BWTree {
   // pid_t is sufficient to create a delta node and CAS it in.  The traversal
   // path is also available if the node get's deleted while we're CASing in.
   FindDataNodeResult FindDataNode(const KeyType key) const {
+    // The result
+    FindDataNodeResult result;
+
     // The path we take during the traversal/search
     std::stack<pid_t> traversal;
-
+    // The PID of the node we're currently probing
     pid_t curr = root_pid_.load();
     while (true) {
       assert(curr != kInvalidPid);
@@ -627,11 +681,11 @@ class BWTree {
         // leaf node
         // NOTE: It can be guaranteed that if the node has been deleted, the
         //       last delta (head of the chain) MUST be a DeltaRemoveNode.
-        if (curr_node->node_type != Node::NodeType::DeltaRemoveLeaf) {
-          break;
-        } else {
+        if (IsDeleted(curr_node)) {
           curr = traversal.top();
           traversal.pop();
+        } else {
+          break;
         }
       } else {
         // Is an inner node, perform a search for the key in the inner node,
@@ -650,7 +704,6 @@ class BWTree {
     }
 
     // Probe the leaf
-    FindDataNodeResult result;
     result.node_pid = curr;
     result.head = GetNode(curr);
     result.traversal_path = traversal;
@@ -808,8 +861,8 @@ class BWTree {
     }
   }
 
-  void CollapseLeafData(
-      Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
+  std::pair<pid_t, pid_t> CollapseLeafData(
+        Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
     assert(node != nullptr);
     assert(IsLeaf(node));
     uint32_t chain_length = 0;
@@ -821,6 +874,8 @@ class BWTree {
     std::vector<std::pair<KeyType, ValueType>> inserted;
     std::vector<std::pair<KeyType, ValueType>> deleted;
 
+    pid_t left_sibling = kInvalidPid;
+    pid_t right_sibling = kInvalidPid;
     KeyType* stop_key = nullptr;
     Node* curr = node;
     while (curr->node_type != Node::NodeType::Leaf) {
@@ -867,6 +922,9 @@ class BWTree {
         case Node::NodeType::DeltaSplit: {
           DeltaSplit* split = static_cast<DeltaSplit*>(curr);
           stop_key = &split->split_key;
+          if (right_sibling == kInvalidPid) {
+            right_sibling = split->new_right;
+          }
           break;
         }
         default: {
@@ -938,6 +996,47 @@ class BWTree {
              !value_comparator_.Compare(output[i-1].second, output[i].second));
     }
 #endif
+    return std::make_pair(left_sibling, right_sibling);
+  }
+
+  void ConsolidateNode(pid_t node_pid) {
+    Node* curr = GetNode(node_pid);
+    if (IsLeaf(curr)) {
+      ConsolidateLeafNode(node_pid);
+    } else {
+      ConsolidateInnerNode(node_pid);
+    }
+  }
+
+  void ConsolidateInnerNode(__attribute((unused)) pid_t node_pid) {
+  }
+
+  void ConsolidateLeafNode(pid_t node_pid) {
+    Node* node = nullptr;
+    LeafNode* consolidated = nullptr;
+    do {
+      // Get the current node
+      node = GetNode(node_pid);
+      if (IsDeleted(node)) {
+        // If someone snuck in and deleted the node before we could consolidate
+        // it, then we're really kind of done.  We just mark the node(+chain)
+        // to be deleted in this epoch
+        // TODO: Mark deleted
+        return;
+      }
+
+      // Consolidate data
+      std::vector<std::pair<KeyType, ValueType>> vals;
+      std::pair<pid_t, pid_t> links = CollapseLeafData(node, vals);
+
+      // New leaf node, populate keys and values
+      consolidated = LeafNode::Create(vals.front().first, vals.back().first,
+                                      links.first, links.second, vals.size());
+      for (uint32_t i = 0; i < vals.size(); i++) {
+        consolidated->keys[i] = vals[i].first;
+        consolidated->vals[i] = vals[i].second;
+      }
+    } while (!mapping_table_.Cas(node_pid, node, consolidated));
   }
 
   // For Insert
@@ -1086,6 +1185,11 @@ class BWTree {
     return false;
   }
 
+  bool IsDeleted(const Node* node) const {
+    return node->node_type == Node::NodeType::DeltaRemoveLeaf ||
+           node->node_type == Node::NodeType::DeltaRemoveInner;
+  }
+
   // Check if two keys are equal
   bool EqualKeys(KeyType k1, KeyType k2) const {
     return key_equals_(k1, k2);
@@ -1128,7 +1232,8 @@ class BWTree {
 
   int insert_branch_factor = 500;
 
-  std::atomic<uint64_t> failed_cas_;
+  std::atomic<uint64_t> num_failed_cas_;
+  std::atomic<uint64_t> num_consolidations_;
 };
 
 }  // End index namespace

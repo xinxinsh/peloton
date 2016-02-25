@@ -297,6 +297,8 @@ class BWTree {
     LeafNode* leaf_node;
     // The path the search took
     std::stack<pid_t> traversal_path;
+    // The PID of the first node we find while traversal that needs consolidation
+    pid_t needs_consolidation;
   };
 
 
@@ -454,7 +456,7 @@ class BWTree {
   }
 
   // Insertion
-  void Insert(KeyType key, ValueType value) {
+  bool Insert(KeyType key, ValueType value) {
     FindDataNodeResult result = FindDataNode(key);
 
     Node* prev_root = result.head;
@@ -470,18 +472,16 @@ class BWTree {
     std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(result.head, vals);
 
-    // Check for key and value equality here
-    auto matched = false;
-    for (auto val : vals) {
-      if (key_equals_(key, val.first) &&
-          value_comparator_.Compare(val.second, value)) {
-        matched = true;
-        break;
+    // Check if this is a duplicate key-value pair by binary searching
+    // the values from the leaf we intend to insert into
+    auto range = std::equal_range(vals.begin(), vals.end(), key,
+                                  KeyOnlyComparator{key_comparator_});
+    for (auto iter = range.first, end = range.second; iter != end; ++iter) {
+      std::pair<KeyType, ValueType>& pair = *iter;
+      if (value_comparator_.Compare(pair.second, value)) {
+        LOG_DEBUG("Attempted to insert duplicate key-value pair");
+        return false;
       }
-    }
-    if (matched) {
-      LOG_DEBUG("Attempted duplicate index insertion");
-      return;
     }
 
     // TODO If remove, goto left sibling and insert there in multithreading case
@@ -498,7 +498,6 @@ class BWTree {
       prev_root = mapping_table_.Get(root_pid);
       delta_insert->next = prev_root;
       failed_cas_++;
-      LOG_DEBUG("Failed to CAS in Insert");
     }
 
     LOG_DEBUG("Inserted new index entry");
@@ -506,6 +505,8 @@ class BWTree {
     if (num_entries > insert_branch_factor) {
       // Split(result.leaf_node, node_pid, delta_insert);
     }
+
+    return true;
   }
 
   bool Delete(KeyType key, const ValueType value) {
@@ -526,18 +527,20 @@ class BWTree {
     std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(result.head, vals);
 
-    // Find if the one we're looking for exists
+    // Check if this key-value pair exists in the tree by binary searching
+    // the values from the leaf where the data exists
     bool matched = false;
-    for (auto& val : vals) {
-      if (key_equals_(key, val.first) &&
-          value_comparator_.Compare(val.second, value)) {
+    auto range = std::equal_range(vals.begin(), vals.end(), key,
+                                  KeyOnlyComparator{key_comparator_});
+    for (auto iter = range.first, end = range.second; iter != end; ++iter) {
+      std::pair<KeyType, ValueType>& pair = *iter;
+      if (value_comparator_.Compare(pair.second, value)) {
         matched = true;
         break;
       }
     }
-
     if (!matched) {
-      LOG_DEBUG("Didn't find key-value pair to delete in tree");
+      LOG_DEBUG("Attempted to delete non-existent key-value from index");
       return false;
     }
 

@@ -83,10 +83,9 @@ TEST(IndexTests, BasicTest) {
   // INDEX
   std::unique_ptr<index::Index> index(BuildIndex());
 
+  // Setup key
   std::unique_ptr<storage::Tuple> key0(new storage::Tuple(key_schema, true));
-
   key0->SetValue(0, ValueFactory::GetIntegerValue(100), pool);
-
   key0->SetValue(1, ValueFactory::GetStringValue("a"), pool);
 
   // INSERT
@@ -101,6 +100,13 @@ TEST(IndexTests, BasicTest) {
 
   locations = index->ScanKey(key0.get());
   EXPECT_EQ(locations.size(), 0);
+
+  // Re-insert
+  index->InsertEntry(key0.get(), item0);
+
+  locations = index->ScanKey(key0.get());
+  EXPECT_EQ(locations.size(), 1);
+  EXPECT_EQ(locations[0].block, item0.block);
 
   delete tuple_schema;
 }

@@ -830,10 +830,10 @@ class BWTree {
           if (stop_key == nullptr || key_comparator_(insert->key, *stop_key)) {
             KeyValueEquality kv_equals{key_equals_, value_comparator_,
                                        insert->key, insert->value};
-            if (std::find_if(deleted.begin(), deleted.end(), kv_equals) ==
+            if (std::find_if(inserted.begin(), inserted.end(), kv_equals) ==
+                  inserted.end() &&
+                std::find_if(deleted.begin(), deleted.end(), kv_equals) ==
                     deleted.end()) {
-              // If this key wasn't previously deleted, it's an insert we need
-              // to track
               inserted.push_back(std::make_pair(insert->key, insert->value));
             }
           }

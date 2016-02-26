@@ -204,7 +204,7 @@ class BWTree {
     static InnerNode* Create(KeyType low_key, KeyType high_key,
                              pid_t right_link, pid_t left_link,
                              uint32_t num_entries) {
-      LeafNode* inner = new InnerNode();
+      InnerNode* inner = new InnerNode();
       inner->node_type = Node::NodeType::Inner;
       inner->low_key = low_key;
       inner->high_key = high_key;
@@ -284,7 +284,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct DeltaMerge : public DeltaNode {
     KeyType merge_key;
-    pid_t new_right;
+    Node* old_right;
   };
 
   //===--------------------------------------------------------------------===//
@@ -303,18 +303,37 @@ class BWTree {
   };
 
   //===--------------------------------------------------------------------===//
-  // An index delta indicates that a new index entry was added to this inner
-  // node as a result of a split of one of this node's children.  The low key
-  // represents the key that the split was performed on.  The high key is the
-  // previous key that would guide searches to the now-split node.  We include
-  // both here to quickly determine if a key should go to the newly creted node
-  // contianing half the entries from the node that was split.
+  // An index delta indicates that a new index entry 'low_key' was added to this
+  // inner node as a result of a split of one of this node's children.
+  //
+  // This node says that the range of keys between low_key and high_key
+  // now belong to the node whose PID is new_child_pid
+  //
+  // In code:
+  // - if low_key < search_key < high_key:
+  //     continue along the child_pid node
+  // - else:
+  //     continue along this delta chain to the base inner node
+  //
   // Refer to 'Parent Update' in Section IV.A of the paper for more details.
   //===--------------------------------------------------------------------===//
   struct DeltaIndex : public DeltaNode {
     KeyType low_key;
     KeyType high_key;
-    pid_t child_pid;
+    pid_t new_child_pid;
+  };
+
+  //===--------------------------------------------------------------------===//
+  // A delete index entry delta indicates that a child has been merged into
+  // a sibling and the new owner of the key range from 'low_key' to 'high_key'
+  // is 'new_owner'.
+  //
+  // Refer to 'Parent Update' in Section IV.A of the paper for more details.
+  //===--------------------------------------------------------------------===//
+  struct DeltaDeleteIndex : public DeltaNode {
+    KeyType low_key;
+    KeyType high_key;
+    pid_t new_owner;
   };
 
   //===--------------------------------------------------------------------===//
@@ -367,6 +386,16 @@ class BWTree {
     }
   };
 
+  struct KeyPidEquality {
+    KeyEqualityChecker key_equals;
+    KeyType key;
+    pid_t pid_val;
+
+    bool operator()(const std::pair<KeyType, pid_t>& o) const {
+      return key_equals(key, o.first) && pid_val == o.second;
+    }
+  };
+
   //===--------------------------------------------------------------------===//
   // A functor that is able to compare only the keys of two
   // std::pair<KeyType, ValueType> types.  We use this to perform binary
@@ -388,6 +417,21 @@ class BWTree {
 
     bool operator()(const KeyType& lhs,
                     const std::pair<KeyType, ValueType>& rhs) const {
+      return cmp(lhs, rhs.first);
+    }
+
+    bool operator()(const std::pair<KeyType, pid_t>& first,
+                    const std::pair<KeyType, pid_t>& second) const {
+      return cmp(first.first, second.first);
+    }
+
+    bool operator()(const std::pair<KeyType, pid_t>& lhs,
+                    const KeyType& rhs) const {
+      return cmp(lhs.first, rhs);
+    }
+
+    bool operator()(const KeyType& lhs,
+                    const std::pair<KeyType, pid_t>& rhs) const {
       return cmp(lhs, rhs.first);
     }
   };
@@ -612,6 +656,9 @@ class BWTree {
     if (num_entries < delete_branch_factor) {
       // Merge(result.leaf_node, node_pid, deltaInsert);
     }
+    if (result.needs_consolidation != kInvalidPid) {
+      ConsolidateNode(result.needs_consolidation);
+    }
     LOG_DEBUG("Inserted delta delete to node %lu", result.node_pid);
     return true;
   }
@@ -736,7 +783,7 @@ class BWTree {
           if (key_comparator_(key, merge->merge_key) <= 0) {
             curr_node = merge->next;
           } else {
-            curr_node = GetNode(merge->new_right);
+            curr_node = merge->old_right;
           }
           break;
         }
@@ -757,7 +804,7 @@ class BWTree {
           DeltaIndex* index = static_cast<DeltaIndex*>(curr_node);
           if (key_comparator_(index->low_key, key) < 0 &&
               key_comparator_(key, index->high_key) <= 0) {
-            curr_node = GetNode(index->child_pid);
+            curr_node = GetNode(index->new_child_pid);
           } else {
             curr_node = index->next;
           }
@@ -839,7 +886,7 @@ class BWTree {
             // The key is still in this logical node
             curr = merge->next;
           } else {
-            curr = GetNode(merge->new_right);
+            curr = merge->old_right;
           }
           break;
         }
@@ -859,6 +906,152 @@ class BWTree {
         }
       }
     }
+  }
+
+  std::pair<pid_t, pid_t> CollapseInnerNodeData(
+        Node* node, std::vector<std::pair<KeyType, pid_t>>& output) const {
+    assert(node != nullptr);
+    assert(!IsLeaf(node));
+    uint32_t chain_length = 0;
+
+    std::vector<std::pair<KeyType, pid_t>> inserted;
+    std::vector<std::pair<KeyType, pid_t>> deleted;
+
+    // A vector we keep around to collect merged contents from other nodes
+    std::vector<std::pair<KeyType, pid_t>> merged;
+
+    pid_t left_sibling = kInvalidPid;
+    pid_t right_sibling = kInvalidPid;
+    KeyType* stop_key = nullptr;
+    Node* curr = node;
+    while (curr->node_type != Node::NodeType::Leaf) {
+      switch (curr->node_type) {
+        case Node::NodeType::DeltaIndex: {
+          DeltaIndex* index = static_cast<DeltaIndex*>(curr);
+          // If there was a previous split node and the inserted index is for a
+          // key that belongs to the right-half, we don't consider it an
+          // entry in this logical node. It is part this node's right sibling
+          if (stop_key == nullptr || key_comparator_(*stop_key, index->low_key)) {
+            // Check if low key belongs in inserted index entries (and in the
+            // colapsed contents for this node)
+            KeyPidEquality low_kv_equals{key_equals_, index->low_key, index->new_child_pid};
+            if (std::find_if(inserted.begin(), inserted.end(), low_kv_equals) == inserted.end() &&
+                std::find_if(deleted.begin(), deleted.end(), low_kv_equals) == deleted.end()) {
+              inserted.push_back(std::make_pair(index->low_key, index->new_child_pid));
+            }
+            // Now check the high key
+            KeyPidEquality high_kv_equals{key_equals_, index->high_key, index->new_child_pid};
+            if (std::find_if(inserted.begin(), inserted.end(), high_kv_equals) == inserted.end() &&
+                std::find_if(deleted.begin(), deleted.end(), high_kv_equals) == deleted.end()) {
+              inserted.push_back(std::make_pair(index->high_key, index->new_child_pid));
+            }
+          }
+          curr = index->next;
+          break;
+        }
+        case Node::NodeType::DeltaDeleteIndex: {
+          DeltaDeleteIndex* del = static_cast<DeltaDeleteIndex*>(curr);
+          // Check if low_key belongs in the collapsed contents
+          KeyPidEquality low_kv_equals{key_equals_, del->low_key, del->new_owner};
+          if (std::find_if(inserted.begin(), inserted.end(), low_kv_equals) == inserted.end() &&
+              std::find_if(deleted.begin(), deleted.end(), low_kv_equals) == deleted.end()) {
+            deleted.push_back(std::make_pair(del->low_key, del->new_owner));
+          }
+          // Check if low_key belongs in the collapsed contents
+          KeyPidEquality high_kv_equals{key_equals_, del->high_key, del->new_owner};
+          if (std::find_if(inserted.begin(), inserted.end(), high_kv_equals) == inserted.end() &&
+              std::find_if(deleted.begin(), deleted.end(), high_kv_equals) == deleted.end()) {
+            deleted.push_back(std::make_pair(del->high_key, del->new_owner));
+          }
+          curr = del->next;
+          break;
+        }
+        case Node::NodeType::DeltaMergeInner: {
+          DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
+          CollapseInnerNodeData(merge->old_right, merged);
+          curr = merge->next;
+          break;
+        }
+        case Node::NodeType::DeltaSplit: {
+          DeltaSplit* split = static_cast<DeltaSplit*>(curr);
+          stop_key = &split->split_key;
+          if (right_sibling == kInvalidPid) {
+            right_sibling = split->new_right;
+          }
+          break;
+        }
+        default: {
+          LOG_DEBUG("Hit node type %s when collapsing leaf data. This is bad.",
+                    std::to_string(curr->node_type).c_str());
+          assert(false);
+        }
+      }
+      chain_length++;
+    }
+
+    LOG_DEBUG(
+        "CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d",
+        inserted.size(), deleted.size(), chain_length + 1);
+
+    // Curr now points to the base inner node
+    InnerNode* inner = static_cast<InnerNode*>(curr);
+    KeyOnlyComparator cmp{key_comparator_};
+
+    // Put all leaf data into the output vector
+    for (uint32_t i = 0; i < inner->num_entries; i++) {
+      output.push_back(std::make_pair(inner->keys[i], inner->children[i]));
+    }
+    for (uint32_t i = 0; i < merged.size(); i++) {
+      output.push_back(merged[i]);
+    }
+
+    // Remove all entries that have been split away from this node
+    if (stop_key != nullptr) {
+      LOG_DEBUG("Collapsed size before removing split data: %lu",
+                output.size());
+      auto pos = std::lower_bound(output.begin(), output.end(), *stop_key, cmp);
+      assert(pos != output.end());
+      output.erase(pos, output.end());
+    }
+
+    LOG_DEBUG("Collapsed size before insertions and deletes: %lu",
+              output.size());
+
+    // Add inserted key-value pairs from the delta chain
+    for (uint32_t i = 0; i < inserted.size(); i++) {
+      auto pos =
+          std::lower_bound(output.begin(), output.end(), inserted[i], cmp);
+      output.insert(pos, inserted[i]);
+    }
+
+    LOG_DEBUG("Collapsed size after insertions: %lu", output.size());
+
+    // Remove deleted key-value pairs from the delta chain
+    for (uint32_t i = 0; i < deleted.size(); i++) {
+      auto range =
+          std::equal_range(output.begin(), output.end(), deleted[i].first, cmp);
+      for (auto pos = range.first, end = range.second; pos != end; ++pos) {
+        std::pair<KeyType, pid_t> key_value = *pos;
+        if (EqualKeys(key_value.first, deleted[i].first) &&
+            key_value.second == deleted[i].second) {
+          output.erase(pos);
+          break;
+        }
+      }
+    }
+
+    LOG_DEBUG("Final collapsed contents size after deletes: %lu",
+              output.size());
+#ifndef NDEBUG
+    // Make sure the output is sorted by keys and contains no duplicate
+    // key-value pairs
+    assert(std::is_sorted(output.begin(), output.end(), cmp));
+    for (uint32_t i = 1; i < output.size(); i++) {
+      assert(key_comparator_(output[i-1].first, output[i].first) ||
+             output[i-1].second != output[i].second);
+    }
+#endif
+    return std::make_pair(left_sibling, right_sibling);
   }
 
   std::pair<pid_t, pid_t> CollapseLeafData(
@@ -915,7 +1108,7 @@ class BWTree {
         }
         case Node::NodeType::DeltaMerge: {
           DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
-          CollapseLeafData(GetNode(merge->new_right), output);
+          CollapseLeafData(merge->old_right, output);
           curr = merge->next;
           break;
         }
@@ -1008,7 +1201,32 @@ class BWTree {
     }
   }
 
-  void ConsolidateInnerNode(__attribute((unused)) pid_t node_pid) {
+  void ConsolidateInnerNode(pid_t node_pid) {
+    Node* node = nullptr;
+    InnerNode* consolidated = nullptr;
+    do {
+      // Get the current node
+      node = GetNode(node_pid);
+      if (IsDeleted(node)) {
+        // If someone snuck in and deleted the node before we could consolidate
+        // it, then we're really kind of done.  We just mark the node(+chain)
+        // to be deleted in this epoch
+        // TODO: Mark deleted
+        return;
+      }
+
+      // Consolidate data
+      std::vector<std::pair<KeyType, pid_t>> vals;
+      std::pair<pid_t, pid_t> links = CollapseInnerNodeData(node, vals);
+
+      // New leaf node, populate keys and values
+      consolidated = InnerNode::Create(vals.front().first, vals.back().first,
+                                       links.first, links.second, vals.size());
+      for (uint32_t i = 0; i < vals.size(); i++) {
+        consolidated->keys[i] = vals[i].first;
+        consolidated->children[i] = vals[i].second;
+      }
+    } while (!mapping_table_.Cas(node_pid, node, consolidated));
   }
 
   void ConsolidateLeafNode(pid_t node_pid) {
@@ -1072,7 +1290,7 @@ class BWTree {
         }
         case Node::NodeType::DeltaMerge: {
           // TODO: Watch out for stale references in multithreading mode.
-          KVMultiset& right_set = getKVsAndCountDelta(mapping_table_.Get(cur->new_right));
+          KVMultiset& right_set = getKVsAndCountDelta(cur->old_right);
           kvs.insert(right_set.begin(), right_set.end());
           break;
         }

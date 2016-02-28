@@ -100,25 +100,29 @@ class EpochManager {
       }
 
       // The tail group has the same epoch and has room
+      assert(to_add->epoch == epoch);
+      assert(to_add->num_items < kGroupSize);
       to_add->items[to_add->num_items++] = freeable;
     }
 
     // Free all deleted data before the given epoch
     void Free(epoch_t epoch) {
-      LOG_DEBUG("Freeing all data deleted before epoch %lu", epoch);
+      uint32_t freed = 0;
       DeletionGroup* curr = head;
       while (curr != nullptr) {
         DeletionGroup* next = curr->next_group;
         if (curr->epoch < epoch) {
-          // Invoke the tagged callback to delete every item in the group
-          for (uint32_t i = 0; i < curr->num_items; i++) {
+          // Free the memory for the item
+          for (uint32_t i = 0; i < curr->num_items; i++, freed++) {
             curr->items[i].Free();
           }
+          // Add the deletion group to the free_to_use list
           curr->next_group = free_to_use_groups;
           free_to_use_groups = curr;
         }
         curr = next;
       }
+      LOG_DEBUG("Freed %u objects before epoch %lu", freed, epoch);
     }
   };
 
@@ -128,8 +132,8 @@ class EpochManager {
   //       because we guarantee that all mutations are performed by
   //       a single thread (the thread whose state it represents)
   struct ThreadState {
-    bool initialized;
-    volatile epoch_t local_epoch;
+    bool initialized = false;
+    volatile epoch_t local_epoch = 0;
     DeletionList deletion_list;
     uint32_t added = 0;
     uint32_t deleted = 0;
@@ -163,11 +167,13 @@ class EpochManager {
         std::this_thread::sleep_for(sleep_duration);
         // Increment global epoch
         global_epoch_++;
+        uint32_t num_states = 0;
         {
           // Find the lowest epoch number among active threads. Data with
           // epoch < lowest can be deleted
           std::lock_guard<std::mutex> lock{states_mutex_};
-          epoch_t lowest = std::numeric_limits<epoch_t>::max();
+          num_states = thread_states_.size();
+          epoch_t lowest = global_epoch_.load();
           for (const auto& iter : thread_states_) {
             ThreadState* state = iter.second;
             if (state->local_epoch < lowest) {
@@ -176,8 +182,9 @@ class EpochManager {
           }
           lowest_epoch_.store(lowest);
         }
-        LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu", global_epoch_.load(),
-                  lowest_epoch_.load());
+        LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu, # states: %u",
+                  global_epoch_.load(), lowest_epoch_.load(), num_states);
+        assert(lowest_epoch_.load() <= global_epoch_.load());
       }
     }};
   }

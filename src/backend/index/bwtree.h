@@ -696,6 +696,9 @@ class BWTree {
     uint32_t slot = found_pos - vals.begin();
 
     LOG_DEBUG("Found key in leaf slot %d", slot);
+    if (result.node_to_consolidate != kInvalidPid) {
+      ConsolidateNode(result.node_to_consolidate);
+    }
 
     return Iterator{*this, slot, result.node_pid, result.node, std::move(vals)};
   }
@@ -1463,7 +1466,7 @@ class BWTree {
   void FreeNode(Node* node) {
     uint32_t chain_length = 0;
     Node* curr = node;
-    while (curr->node_type != Node::NodeType::Inner ||
+    while (curr->node_type != Node::NodeType::Inner &&
            curr->node_type != Node::NodeType::Leaf) {
       // Curr is a delta node since it isn't a base inner or base leaf node
       DeltaNode* delta = static_cast<DeltaNode*>(curr);

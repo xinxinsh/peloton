@@ -378,6 +378,10 @@ class BWTree {
     }
   };
 
+  //===--------------------------------------------------------------------===//
+  // A functor that is able to match a given key-pid pair in a collection
+  // of std::pair<KeyType, pid_t>
+  //===--------------------------------------------------------------------===//
   struct KeyPidEquality {
     KeyEqualityChecker key_equals;
     KeyType key;
@@ -428,6 +432,22 @@ class BWTree {
     }
   };
 
+  //===--------------------------------------------------------------------===//
+  // This is the struct that we use when we mark nodes as deleted.  The epoch
+  // manager invokes the Free(...) callback when the given data can be deleted.
+  // We just call tree.FreeNode(...) with the provided node.
+  //===--------------------------------------------------------------------===//
+  struct NodeDeleter {
+    // The tree
+    BWTree<KeyType, ValueType, KeyComparator, ValueComparator, KeyEqualityChecker>* tree;
+    // The node that can be deleted
+    Node* node;
+
+    void Free() {
+      tree->FreeNode(node);
+    }
+  };
+
  public:
   //===--------------------------------------------------------------------===//
   // Our STL iterator over the tree.  We use this guy for both forward and
@@ -452,7 +472,7 @@ class BWTree {
     // Increment
     BWTreeIterator& operator++() {
       // Enter the epoch
-      EpochGuard guard{const_cast<EpochManager&>(tree_.epoch_manager_)};
+      EpochGuard<NodeDeleter> guard{const_cast<EpochManager<NodeDeleter>&>(tree_.epoch_manager_)};
 
       if (curr_idx_ + 1 < collapsed_contents_.size()) {
         curr_idx_++;
@@ -520,6 +540,7 @@ class BWTree {
                           KeyEqualityChecker>::BWTreeIterator Iterator;
   typedef typename std::multiset<std::pair<KeyType, ValueType>> KVMultiset;
   friend class BWTreeIterator;
+  friend class NodeDeleter;
 
   // Constructor
   BWTree(KeyComparator keyComparator, ValueComparator valueComparator,
@@ -548,7 +569,7 @@ class BWTree {
   // Insertion
   bool Insert(KeyType key, ValueType value) {
     // Enter the epoch
-    EpochGuard guard{epoch_manager_};
+    EpochGuard<NodeDeleter> guard{epoch_manager_};
 
     // Find the leaf-level node where we'll insert the data
     FindDataNodeResult result = FindDataNode(key);
@@ -603,7 +624,7 @@ class BWTree {
 
   bool Delete(KeyType key, const ValueType value) {
     // Enter the epoch
-    EpochGuard guard{epoch_manager_};
+    EpochGuard<NodeDeleter> guard{epoch_manager_};
 
     // Find the leaf-level node where we'll insert the data
     FindDataNodeResult result = FindDataNode(key);
@@ -655,7 +676,7 @@ class BWTree {
   // provided key, or an iterator that is equal to what is returned by end()
   Iterator Search(const KeyType key) {
     // Enter the epoch
-    EpochGuard guard{epoch_manager_};
+    EpochGuard<NodeDeleter> guard{epoch_manager_};
 
     // Find the data node where the key may be
     FindDataNodeResult result = FindDataNode(key);
@@ -1237,7 +1258,7 @@ class BWTree {
 
     // Mark the node as deleted
     assert(node != nullptr);
-    //epoch_manager_.MarkDeleted((char*)node);
+    epoch_manager_.MarkDeleted(NodeDeleter{this, node});
   }
 
   void ConsolidateLeafNode(pid_t node_pid) {
@@ -1274,7 +1295,7 @@ class BWTree {
 
     // Mark the node as deleted
     assert(node != nullptr);
-    //epoch_manager_.MarkDeleted((char*)node);
+    epoch_manager_.MarkDeleted(NodeDeleter{this, node});
   }
 
   // For Insert
@@ -1438,6 +1459,27 @@ class BWTree {
     return value_comparator_.Compare(v1, v2);
   }
 
+  // Delete the memory for this node's delta chain and base node
+  void FreeNode(Node* node) {
+    uint32_t chain_length = 0;
+    Node* curr = node;
+    while (curr->node_type != Node::NodeType::Inner ||
+           curr->node_type != Node::NodeType::Leaf) {
+      // Curr is a delta node since it isn't a base inner or base leaf node
+      DeltaNode* delta = static_cast<DeltaNode*>(curr);
+      // Save the next link on the chain
+      Node* next = delta->next;
+      // Delete the node
+      delete curr;
+      // Move along
+      curr = next;
+      chain_length++;
+    }
+    LOG_DEBUG("Freed node of type %d with chain length of %u", curr->node_type,
+              chain_length);
+    delete curr;
+  }
+
  private:
   // PID allocator
   std::atomic<uint64_t> pid_allocator_;
@@ -1467,7 +1509,7 @@ class BWTree {
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
 
   // The epoch manager
-  EpochManager epoch_manager_;
+  EpochManager<NodeDeleter> epoch_manager_;
 
   // TODO: just a randomly chosen number now...
   uint32_t delete_branch_factor = 100;

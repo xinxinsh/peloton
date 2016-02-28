@@ -31,11 +31,8 @@ namespace index {
 // epoch that a thread is current in to determine whether memory it has
 // marked as deleted can actually be physically deleted.
 //===--------------------------------------------------------------------===//
+template <class Freeable>
 class EpochManager {
- public:
-  // The deleter function
-  typedef void (*deleter_t)(char*);
-
  private:
   // The type of the epoch
   typedef uint64_t epoch_t;
@@ -46,7 +43,7 @@ class EpochManager {
   // deleted together
   static const uint32_t kGroupSize = 32;
   struct DeletionGroup {
-    std::array<std::pair<char*, deleter_t>, kGroupSize> items;
+    std::array<Freeable, kGroupSize> items;
     epoch_t epoch;
     uint32_t num_items = 0;
     DeletionGroup* next_group = nullptr;
@@ -58,6 +55,8 @@ class EpochManager {
     DeletionGroup* free_to_use_groups = nullptr;
 
     ~DeletionList() {
+      LOG_DEBUG("Freeing all memory in all deletion groups during shutdown");
+
       // Free all the stuff that was marked deleted, but was potentially in use
       // by another thread.  We can do this because we're shutting down.
       Free(std::numeric_limits<epoch_t>::max());
@@ -76,7 +75,7 @@ class EpochManager {
       }
     }
 
-    void MarkDeleted(char* ptr, deleter_t del, epoch_t epoch) {
+    void MarkDeleted(Freeable freeable, epoch_t epoch) {
       DeletionGroup* to_add = nullptr;
 
       if (head == nullptr) {
@@ -101,18 +100,20 @@ class EpochManager {
       }
 
       // The tail group has the same epoch and has room
-      to_add->items[to_add->num_items++] = std::make_pair(ptr, del);
+      to_add->items[to_add->num_items++] = freeable;
     }
 
     // Free all deleted data before the given epoch
     void Free(epoch_t epoch) {
+      LOG_DEBUG("Freeing all data deleted before epoch %lu", epoch);
       DeletionGroup* curr = head;
       while (curr != nullptr) {
         DeletionGroup* next = curr->next_group;
         if (curr->epoch < epoch) {
           // Invoke the tagged callback to delete every item in the group
           for (uint32_t i = 0; i < curr->num_items; i++) {
-            curr->items[i].second(curr->items[i].first);
+            //curr->items[i].second(curr->items[i].first);
+            curr->items[i].Free();
           }
           curr->next_group = free_to_use_groups;
           free_to_use_groups = curr;
@@ -195,18 +196,21 @@ class EpochManager {
     self_state->local_epoch = GetCurrentEpoch();
   }
 
-  // Called by a thread that wishes to mark the provided data ptr as deleted in
-  // this epoch.  The data will not be deleted immediately, but only when it
-  // it safe to do so, i.e., when all active threads have quiesced and exited
-  // the epoch.
-  void MarkDeleted(char* ptr, deleter_t deleter) {
+  // Called by a thread that wishes to mark the provided freeable entity as
+  // deleted in this epoch. The data will not be deleted immediately, but only
+  // when it it safe to do so, i.e., when all active threads have quiesced and
+  // exited the epoch.
+  // 
+  // Note: The Freeable type must have a Free(...) function that can be called
+  //       to physically free the memory
+  void MarkDeleted(Freeable freeable) {
     auto* self_state = GetThreadState();
     assert(self_state->initialized);
 
     // Get the deletion list for the thread and mark the ptr as deleted by
     // this thread in the thread's local epoch
     auto& deletion_list = self_state->deletion_list;
-    deletion_list.MarkDeleted(ptr, deleter, self_state->local_epoch);
+    deletion_list.MarkDeleted(freeable, self_state->local_epoch);
   }
 
   // The thread wants to exit the epoch, indicating it no longer needs
@@ -241,10 +245,11 @@ class EpochManager {
 // A handy scoped guard that callers can use at the beginning of pieces of
 // code they need to execute within an epoch(s)
 //===--------------------------------------------------------------------===//
+template <class Type>
 class EpochGuard {
  public:
   // Constructor (enters the current epoch)
-  EpochGuard(EpochManager& em): em_(em) {
+  EpochGuard(EpochManager<Type>& em): em_(em) {
     em_.EnterEpoch();
   }
   // Desctructor (exits the epoch)
@@ -253,7 +258,7 @@ class EpochGuard {
   }
  private:
   // The epoch manager
-  EpochManager& em_;
+  EpochManager<Type>& em_;
 };
 
 }  // End index namespace

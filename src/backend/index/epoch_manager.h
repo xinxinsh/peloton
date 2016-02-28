@@ -112,7 +112,6 @@ class EpochManager {
         if (curr->epoch < epoch) {
           // Invoke the tagged callback to delete every item in the group
           for (uint32_t i = 0; i < curr->num_items; i++) {
-            //curr->items[i].second(curr->items[i].first);
             curr->items[i].Free();
           }
           curr->next_group = free_to_use_groups;
@@ -145,10 +144,7 @@ class EpochManager {
  public:
   // Constructor
   EpochManager()
-      : global_epoch_(0),
-        lowest_epoch_(0),
-        stop_(false),
-        epoch_mover_() {
+      : global_epoch_(0), lowest_epoch_(0), stop_(false), epoch_mover_() {
     /* Nothing */
   }
 
@@ -163,9 +159,10 @@ class EpochManager {
       LOG_DEBUG("Starting epoch incrementer thread");
       std::chrono::milliseconds sleep_duration{kEpochTimer};
       while (!stop_.load()) {
+        // Sleep
         std::this_thread::sleep_for(sleep_duration);
-        LOG_DEBUG("Epoch incrementer woke up, incrementing epoch to %lu",
-                  ++global_epoch_);
+        // Increment global epoch
+        global_epoch_++;
         {
           // Find the lowest epoch number among active threads. Data with
           // epoch < lowest can be deleted
@@ -179,6 +176,8 @@ class EpochManager {
           }
           lowest_epoch_.store(lowest);
         }
+        LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu", global_epoch_.load(),
+                  lowest_epoch_.load());
       }
     }};
   }
@@ -200,7 +199,7 @@ class EpochManager {
   // deleted in this epoch. The data will not be deleted immediately, but only
   // when it it safe to do so, i.e., when all active threads have quiesced and
   // exited the epoch.
-  // 
+  //
   // Note: The Freeable type must have a Free(...) function that can be called
   //       to physically free the memory
   void MarkDeleted(Freeable freeable) {

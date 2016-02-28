@@ -13,6 +13,7 @@
 #pragma once
 
 #include "backend/common/logger.h"
+#include "backend/index/epoch_manager.h"
 
 #include <algorithm>
 #include <atomic>
@@ -450,6 +451,9 @@ class BWTree {
 
     // Increment
     BWTreeIterator& operator++() {
+      // Enter the epoch
+      EpochGuard guard{const_cast<EpochManager&>(tree_.epoch_manager_)};
+
       if (curr_idx_ + 1 < collapsed_contents_.size()) {
         curr_idx_++;
       } else {
@@ -536,10 +540,16 @@ class BWTree {
     root->vals = nullptr;
     // Insert into mapping table
     mapping_table_.Insert(root_pid_, root);
+
+    // Stop epoch management
+    epoch_manager_.Init();
   }
 
   // Insertion
   bool Insert(KeyType key, ValueType value) {
+    // Enter the epoch
+    EpochGuard guard{epoch_manager_};
+
     // Find the leaf-level node where we'll insert the data
     FindDataNodeResult result = FindDataNode(key);
     assert(result.node != nullptr);
@@ -592,6 +602,9 @@ class BWTree {
   }
 
   bool Delete(KeyType key, const ValueType value) {
+    // Enter the epoch
+    EpochGuard guard{epoch_manager_};
+
     // Find the leaf-level node where we'll insert the data
     FindDataNodeResult result = FindDataNode(key);
     assert(IsLeaf(result.node));
@@ -641,6 +654,9 @@ class BWTree {
   // Return an iterator that points to the element that is associated with the
   // provided key, or an iterator that is equal to what is returned by end()
   Iterator Search(const KeyType key) {
+    // Enter the epoch
+    EpochGuard guard{epoch_manager_};
+
     // Find the data node where the key may be
     FindDataNodeResult result = FindDataNode(key);
     assert(IsLeaf(result.node));
@@ -811,6 +827,8 @@ class BWTree {
       chain_length++;
     }
 
+    LOG_DEBUG("Chain length for inner-node was %u", chain_length);
+
     // Curr now points to the base inner node
     InnerNode* inner = static_cast<InnerNode*>(curr_node);
     auto iter = std::lower_bound(inner->keys, inner->keys + inner->num_entries,
@@ -878,6 +896,8 @@ class BWTree {
       }
       chain_length++;
     }
+
+    LOG_DEBUG("Chain length of leaf-node is %u", chain_length);
 
     // A true blue leaf, just binary search this guy
     LeafNode* leaf = static_cast<LeafNode*>(curr);
@@ -1184,9 +1204,12 @@ class BWTree {
   }
 
   void ConsolidateInnerNode(pid_t node_pid) {
+    uint32_t attempt = 0;
     Node* node = nullptr;
     InnerNode* consolidated = nullptr;
     do {
+      LOG_DEBUG("Consolidating inner-node %lu. Attempt %u", node_pid, attempt++);
+
       // Get the current node
       node = GetNode(node_pid);
       if (IsDeleted(node)) {
@@ -1194,6 +1217,8 @@ class BWTree {
         // it, then we're really kind of done.  We just mark the node(+chain)
         // to be deleted in this epoch
         // TODO: Mark deleted
+        LOG_DEBUG("Looks like inner-node %lu was deleted, not touching ...",
+                  node_pid);
         return;
       }
 
@@ -1209,12 +1234,19 @@ class BWTree {
         consolidated->children[i] = vals[i].second;
       }
     } while (!mapping_table_.Cas(node_pid, node, consolidated));
+
+    // Mark the node as deleted
+    assert(node != nullptr);
+    //epoch_manager_.MarkDeleted((char*)node);
   }
 
   void ConsolidateLeafNode(pid_t node_pid) {
+    uint32_t attempt = 0;
     Node* node = nullptr;
     LeafNode* consolidated = nullptr;
     do {
+      LOG_DEBUG("Consolidating leaf-node %lu. Attempt %u", node_pid, attempt++);
+
       // Get the current node
       node = GetNode(node_pid);
       if (IsDeleted(node)) {
@@ -1222,6 +1254,8 @@ class BWTree {
         // it, then we're really kind of done.  We just mark the node(+chain)
         // to be deleted in this epoch
         // TODO: Mark deleted
+        LOG_DEBUG("Looks like leaf-node %lu was deleted, not touching ...",
+                  node_pid);
         return;
       }
 
@@ -1237,6 +1271,10 @@ class BWTree {
         consolidated->vals[i] = vals[i].second;
       }
     } while (!mapping_table_.Cas(node_pid, node, consolidated));
+
+    // Mark the node as deleted
+    assert(node != nullptr);
+    //epoch_manager_.MarkDeleted((char*)node);
   }
 
   // For Insert
@@ -1427,6 +1465,9 @@ class BWTree {
 
   // The mapping table
   MappingTable<pid_t, Node*, DumbHash> mapping_table_;
+
+  // The epoch manager
+  EpochManager epoch_manager_;
 
   // TODO: just a randomly chosen number now...
   uint32_t delete_branch_factor = 100;

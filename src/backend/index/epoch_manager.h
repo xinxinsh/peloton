@@ -22,6 +22,13 @@
 namespace peloton {
 namespace index {
 
+//===--------------------------------------------------------------------===//
+// The epoch manager tracks epochs in the system and arranges for memory
+// reclamation at safe points. There is no global GC, but rather, each thread
+// uses information about it's own epoch, the current epoch and lowest
+// epoch that a thread is current in to determine whether memory it has
+// marked as deleted can actually be physically deleted.
+//===--------------------------------------------------------------------===//
 class EpochManager {
  private:
   typedef uint64_t epoch_t;
@@ -166,7 +173,6 @@ class EpochManager {
     return &thread_state;
   }
 
-
   // The global epoch number
   std::atomic<epoch_t> global_epoch_;
   // The current minimum epoch that any transaction is in
@@ -176,17 +182,22 @@ class EpochManager {
   std::thread epoch_mover_;
 };
 
+//===--------------------------------------------------------------------===//
+// A handy scoped guard that callers can use at the beginning of pieces of
+// code they need to execute within an epoch(s)
+//===--------------------------------------------------------------------===//
 class EpochGuard {
  public:
+  // Constructor (enters the current epoch)
   EpochGuard(EpochManager& em): em_(em) {
     em_.EnterEpoch();
   }
-
+  // Desctructor (exits the epoch)
   ~EpochGuard() {
     em_.ExitEpoch();
   }
-
  private:
+  // The epoch manager
   EpochManager& em_;
 };
 

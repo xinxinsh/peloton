@@ -62,13 +62,12 @@ class EpochManager {
       Free(std::numeric_limits<epoch_t>::max());
 
       // Reclaim memory we created for deletion groups
-      while (head != nullptr && head->next_group != nullptr) {
+      while (head != nullptr) {
         DeletionGroup* tmp = head;
         head = head->next_group;
         delete tmp;
       }
-      while (free_to_use_groups != nullptr &&
-             free_to_use_groups->next_group != nullptr) {
+      while (free_to_use_groups != nullptr) {
         DeletionGroup* tmp = free_to_use_groups;
         free_to_use_groups = free_to_use_groups->next_group;
         delete tmp;

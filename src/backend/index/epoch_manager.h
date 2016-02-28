@@ -158,34 +158,38 @@ class EpochManager {
   }
 
   void Init() {
-    epoch_mover_ = std::thread{[=]() {
-      LOG_DEBUG("Starting epoch incrementer thread");
-      std::chrono::milliseconds sleep_duration{kEpochTimer};
-      while (!stop_.load()) {
-        // Sleep
-        std::this_thread::sleep_for(sleep_duration);
-        // Increment global epoch
-        global_epoch_++;
-        uint32_t num_states = 0;
-        {
-          // Find the lowest epoch number among active threads. Data with
-          // epoch < lowest can be deleted
-          std::lock_guard<std::mutex> lock{states_mutex_};
-          num_states = thread_states_.size();
-          epoch_t lowest = global_epoch_.load();
-          for (const auto& iter : thread_states_) {
-            ThreadState* state = iter.second;
-            if (state->local_epoch < lowest) {
-              lowest = state->local_epoch;
-            }
+    // Start the epoch ticker thread
+    epoch_mover_ = std::thread{&EpochManager::EpochTicker, this};
+  }
+
+  void EpochTicker() {
+    LOG_DEBUG("Starting epoch ticker thread");
+    std::chrono::milliseconds sleep_duration{kEpochTimer};
+    while (!stop_.load()) {
+      // Sleep
+      std::this_thread::sleep_for(sleep_duration);
+      // Increment global epoch
+      global_epoch_++;
+      uint32_t num_states = 0;
+      {
+        // Find the lowest epoch number among active threads. Data with
+        // epoch < lowest can be deleted
+        std::lock_guard<std::mutex> lock{states_mutex_};
+        num_states = thread_states_.size();
+        epoch_t lowest = global_epoch_.load();
+        for (const auto& iter : thread_states_) {
+          ThreadState* state = iter.second;
+          if (state->local_epoch < lowest) {
+            lowest = state->local_epoch;
           }
-          lowest_epoch_.store(lowest);
         }
-        LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu, # states: %u",
-                  global_epoch_.load(), lowest_epoch_.load(), num_states);
-        assert(lowest_epoch_.load() <= global_epoch_.load());
+        lowest_epoch_.store(lowest);
       }
-    }};
+      LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu, # states: %u",
+                global_epoch_.load(), lowest_epoch_.load(), num_states);
+      assert(lowest_epoch_.load() <= global_epoch_.load());
+    }
+    LOG_DEBUG("Shutting down epoch ticker thread");
   }
 
   // Called by threads that want to enter the current epoch, indicating that

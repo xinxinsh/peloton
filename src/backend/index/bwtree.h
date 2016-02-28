@@ -137,7 +137,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct Node {
     enum NodeType {
-      Inner,
+      Inner = 0,
       Leaf,
       DeltaInsert,
       DeltaDelete,
@@ -1472,19 +1472,18 @@ class BWTree {
     Node* curr = node;
     while (curr->node_type != Node::NodeType::Inner &&
            curr->node_type != Node::NodeType::Leaf) {
-      // Curr is a delta node since it isn't a base inner or base leaf node
       DeltaNode* delta = static_cast<DeltaNode*>(curr);
-      // Save the next link on the chain
-      Node* next = delta->next;
-      // Delete the node
-      delete curr;
-      // Move along
-      curr = next;
+      curr = delta->next;
+      delete delta;
       chain_length++;
     }
-    LOG_DEBUG("Freed node (%p) type %d with chain length of %u",
-              node, curr->node_type, chain_length);
+    auto node_type = curr->node_type;
+
+    // Delete the base node
     delete curr;
+
+    LOG_DEBUG("Freed node (%p) type %d with chain length of %u",
+              node, node_type, chain_length);
   }
 
  private:

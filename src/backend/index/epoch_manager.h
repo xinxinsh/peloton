@@ -108,21 +108,20 @@ class EpochManager {
     // Free all deleted data before the given epoch
     void Free(epoch_t epoch) {
       uint32_t freed = 0;
-      DeletionGroup* curr = head;
-      while (curr != nullptr) {
-        DeletionGroup* next = curr->next_group;
-        if (curr->epoch < epoch) {
-          // Free the memory for the item
-          for (uint32_t i = 0; i < curr->num_items; i++, freed++) {
-            curr->items[i].Free();
-          }
-          // Add the deletion group to the free_to_use list
-          curr->next_group = free_to_use_groups;
-          free_to_use_groups = curr;
+      while (head != nullptr && head->epoch < epoch) {
+        DeletionGroup* next = head->next_group;
+        // All items in the head deletion group can be freed
+        for (uint32_t i = 0; i < head->num_items; i++, freed++) {
+          head->items[i].Free();
         }
-        curr = next;
+        // Add the deletion group to the free_to_use list
+        head->next_group = free_to_use_groups;
+        free_to_use_groups = head;
+        head = next;
       }
-      LOG_DEBUG("Freed %u objects before epoch %lu", freed, epoch);
+      if (freed > 0) {
+        LOG_DEBUG("Freed %u objects before epoch %lu", freed, epoch);
+      }
     }
   };
 

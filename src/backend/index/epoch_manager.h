@@ -17,7 +17,9 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
 namespace peloton {
 namespace index {
@@ -30,15 +32,21 @@ namespace index {
 // marked as deleted can actually be physically deleted.
 //===--------------------------------------------------------------------===//
 class EpochManager {
+ public:
+  // The deleter function
+  typedef void (*deleter_t)(char*);
+
  private:
+  // The type of the epoch
   typedef uint64_t epoch_t;
+  // The frequency the global epoch is updated
   static const uint64_t kEpochTimer = 40;
 
   // Represents a group of items belonging to the same epoch that can be
   // deleted together
   static const uint32_t kGroupSize = 32;
   struct DeletionGroup {
-    std::array<char*, kGroupSize> items;
+    std::array<std::pair<char*, deleter_t>, kGroupSize> items;
     epoch_t epoch;
     uint32_t num_items = 0;
     DeletionGroup* next_group = nullptr;
@@ -50,6 +58,11 @@ class EpochManager {
     DeletionGroup* free_to_use_groups = nullptr;
 
     ~DeletionList() {
+      // Free all the stuff that was marked deleted, but was potentially in use
+      // by another thread.  We can do this because we're shutting down.
+      Free(std::numeric_limits<epoch_t>::max());
+
+      // Reclaim memory we created for deletion groups
       while (head != nullptr && head->next_group != nullptr) {
         DeletionGroup* tmp = head;
         head = head->next_group;
@@ -63,7 +76,7 @@ class EpochManager {
       }
     }
 
-    void MarkDeleted(char* ptr, epoch_t epoch) {
+    void MarkDeleted(char* ptr, deleter_t del, epoch_t epoch) {
       DeletionGroup* to_add = nullptr;
 
       if (head == nullptr) {
@@ -88,7 +101,24 @@ class EpochManager {
       }
 
       // The tail group has the same epoch and has room
-      to_add->items[to_add->num_items++] = ptr;
+      to_add->items[to_add->num_items++] = std::make_pair(ptr, del);
+    }
+
+    // Free all deleted data before the given epoch
+    void Free(epoch_t epoch) {
+      DeletionGroup* curr = head;
+      while (curr != nullptr) {
+        DeletionGroup* next = curr->next_group;
+        if (curr->epoch < epoch) {
+          // Invoke the tagged callback to delete every item in the group
+          for (uint32_t i = 0; i < curr->num_items; i++) {
+            curr->items[i].second(curr->items[i].first);
+          }
+          curr->next_group = free_to_use_groups;
+          free_to_use_groups = curr;
+        }
+        curr = next;
+      }
     }
   };
 
@@ -99,17 +129,23 @@ class EpochManager {
   //       a single thread (the thread whose state it represents)
   struct ThreadState {
     bool initialized;
-    epoch_t local_epoch;
+    volatile epoch_t local_epoch;
     DeletionList deletion_list;
     uint32_t added = 0;
     uint32_t deleted = 0;
   };
 
+  // Get the epoch thread state for the currently executing thread
+  ThreadState* GetThreadState() {
+    static thread_local ThreadState thread_state;
+    return &thread_state;
+  }
+
  public:
   // Constructor
   EpochManager()
       : global_epoch_(0),
-        low_epoch_(0),
+        lowest_epoch_(0),
         stop_(false),
         epoch_mover_() {
     /* Nothing */
@@ -129,6 +165,19 @@ class EpochManager {
         std::this_thread::sleep_for(sleep_duration);
         LOG_DEBUG("Epoch incrementer woke up, incrementing epoch to %lu",
                   ++global_epoch_);
+        {
+          // Find the lowest epoch number among active threads. Data with
+          // epoch < lowest can be deleted
+          std::lock_guard<std::mutex> lock{states_mutex_};
+          epoch_t lowest = std::numeric_limits<epoch_t>::max();
+          for (const auto& iter : thread_states_) {
+            ThreadState* state = iter.second;
+            if (state->local_epoch < lowest) {
+              lowest = state->local_epoch;
+            }
+          }
+          lowest_epoch_.store(lowest);
+        }
       }
     }};
   }
@@ -136,29 +185,37 @@ class EpochManager {
   // Called by threads that want to enter the current epoch, indicating that
   // it will need all resources that are visible in this epoch
   void EnterEpoch() {
-    auto* thread_state = GetThreadState();
-    if (!thread_state->initialized) {
+    auto* self_state = GetThreadState();
+    if (!self_state->initialized) {
       // do init
-      thread_state->initialized = true;
+      self_state->initialized = true;
+      std::lock_guard<std::mutex> lock{states_mutex_};
+      thread_states_[std::this_thread::get_id()] = self_state;
     }
-    thread_state->local_epoch = GetCurrentEpoch();
+    self_state->local_epoch = GetCurrentEpoch();
   }
 
   // Called by a thread that wishes to mark the provided data ptr as deleted in
   // this epoch.  The data will not be deleted immediately, but only when it
   // it safe to do so, i.e., when all active threads have quiesced and exited
   // the epoch.
-  void MarkDeleted(char* ptr) {
-    auto* thread_state = GetThreadState();
-    assert(thread_state->initialized);
-    thread_state->deletion_list.MarkDeleted(ptr, thread_state->local_epoch);
+  void MarkDeleted(char* ptr, deleter_t deleter) {
+    auto* self_state = GetThreadState();
+    assert(self_state->initialized);
+
+    // Get the deletion list for the thread and mark the ptr as deleted by
+    // this thread in the thread's local epoch
+    auto& deletion_list = self_state->deletion_list;
+    deletion_list.MarkDeleted(ptr, deleter, self_state->local_epoch);
   }
 
   // The thread wants to exit the epoch, indicating it no longer needs
   // protected access to the data
   void ExitEpoch() {
-    auto* thread_state = GetThreadState();
-    assert(thread_state->initialized);
+    auto* self_state = GetThreadState();
+    assert(self_state->initialized);
+    auto& deletion_list = self_state->deletion_list;
+    deletion_list.Free(lowest_epoch_.load());
   }
 
   // Get the current epoch
@@ -167,19 +224,17 @@ class EpochManager {
   }
 
  private:
-  // Get the epoch thread state for the currently executing thread
-  ThreadState* GetThreadState() {
-    static thread_local ThreadState thread_state;
-    return &thread_state;
-  }
 
   // The global epoch number
   std::atomic<epoch_t> global_epoch_;
   // The current minimum epoch that any transaction is in
-  std::atomic<epoch_t> low_epoch_;
+  std::atomic<epoch_t> lowest_epoch_;
   // The thread that increments the epoch
   std::atomic<bool> stop_;
   std::thread epoch_mover_;
+  // The map from threads to their states, and mutex that protects it
+  std::mutex states_mutex_;
+  std::unordered_map<std::thread::id, ThreadState*> thread_states_;
 };
 
 //===--------------------------------------------------------------------===//

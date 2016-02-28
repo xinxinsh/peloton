@@ -921,16 +921,22 @@ class BWTree {
       chain_length++;
     }
 
-    LOG_DEBUG("Chain length of leaf-node is %u", chain_length);
+    LOG_DEBUG("FindInLeafNode: Node chain length is %u", chain_length);
 
-    // A true blue leaf, just binary search this guy
+    // We're at the base leaf, just binary search the guy
     LeafNode* leaf = static_cast<LeafNode*>(curr);
-    auto pos = std::lower_bound(leaf->keys, leaf->keys + leaf->num_entries,
-                                 key, key_comparator_);
-    uint32_t index = pos - leaf->keys;
-    bool found = index < leaf->num_entries &&
-        key_equals_(key, leaf->keys[index]) &&
-        value_comparator_.Compare(val, leaf->vals[index]);
+
+    // TODO: We need a key-value comparator so that we can use binary search
+    auto range = std::equal_range(leaf->keys, leaf->keys + leaf->num_entries,
+                                  key, key_comparator_);
+    bool found = false;
+    for (uint32_t i = range.first - leaf->keys, end = range.second - leaf->keys;
+         i < end; i++) {
+      if (value_comparator_.Compare(val, leaf->vals[i])) {
+        found = true;
+        break;
+      }
+    }
     return std::make_pair(found, chain_length >= chain_length_threshold);
   }
 

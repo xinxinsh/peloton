@@ -26,10 +26,25 @@ namespace index {
 
 //===--------------------------------------------------------------------===//
 // The epoch manager tracks epochs in the system and arranges for memory
-// reclamation at safe points. There is no global GC, but rather, each thread
-// uses information about it's own epoch, the current epoch and lowest
-// epoch that a thread is current in to determine whether memory it has
-// marked as deleted can actually be physically deleted.
+// reclamation at safe points. There is no global GC thread, but rather each
+// thread performs GC on data items it has deleted.
+//
+// There is a global epoch timer that is updated at kEpochTimer (ms) intervals
+// by a dedicated epoch ticker thread.  In addition to moving the epoch, this
+// thread also discovers the lowest active epoch amongst all threads that have
+// registered with this manager.
+//
+// Every thread has state (ThreadState) that tracks the current epoch it is in.
+// Most importantly, this state also tracks all items that have been marked
+// deleted by the thread.  This information is stored in a linked list of
+// DeletionGroups. A deletion group just represents a collection of items that
+// have been marked as garbage in the same epoch.  Because epochs increase
+// monotonically, it can be guaranteed that the head of the deletion list
+// has a lower epoch that those groups towards the tail of the list.
+//
+// When a thread exits an epoch, it uses the lowest epoch variable that is
+// updated by the ticker thread to determine the items that can be safely
+// freed. A thread only ever frees deleted items it marked itself.
 //===--------------------------------------------------------------------===//
 template <class Freeable>
 class EpochManager {
@@ -62,62 +77,77 @@ class EpochManager {
       Free(std::numeric_limits<epoch_t>::max());
 
       // Reclaim memory we created for deletion groups
-      while (head != nullptr && head->next_group != nullptr) {
+      while (head != nullptr) {
         DeletionGroup* tmp = head;
         head = head->next_group;
         delete tmp;
       }
-      while (free_to_use_groups != nullptr &&
-             free_to_use_groups->next_group != nullptr) {
+      while (free_to_use_groups != nullptr) {
         DeletionGroup* tmp = free_to_use_groups;
         free_to_use_groups = free_to_use_groups->next_group;
         delete tmp;
       }
     }
 
-    void MarkDeleted(Freeable freeable, epoch_t epoch) {
-      DeletionGroup* to_add = nullptr;
+    // Get a deletion group with sufficient space for items deleted in
+    // the given eopch
+    // TODO: Does it really have to be the same epoch?
+    DeletionGroup* GetAvailableGroup(epoch_t epoch) {
+      if (tail != nullptr && tail->epoch == epoch &&
+          tail->num_items < kGroupSize - 1) {
+        return tail;
+      }
+
+      // Either the tail is null, or has a different epoch or has no room
+      // for new entries.  In any case, we need a new fresh group
+
+      DeletionGroup* group = nullptr;
+      if (free_to_use_groups != nullptr) {
+        group = free_to_use_groups;
+        free_to_use_groups = free_to_use_groups->next_group;
+      } else {
+        group = new DeletionGroup();
+      }
+      group->epoch = epoch;
+      group->num_items = 0;
+      group->next_group = nullptr;
 
       if (head == nullptr) {
         assert(tail == nullptr);
-        to_add = new DeletionGroup();
-        to_add->epoch = epoch;
-        to_add->num_items = 0;
-        to_add->next_group = nullptr;
-        tail = head = to_add;
-      } else if (tail->epoch != epoch || tail->num_items >= kGroupSize) {
-        if (free_to_use_groups != nullptr) {
-          to_add = free_to_use_groups;
-          free_to_use_groups = free_to_use_groups->next_group;
-        } else {
-          to_add = new DeletionGroup();
-        }
-        to_add->epoch = epoch;
-        to_add->num_items = 0;
-        to_add->next_group = nullptr;
-        tail->next_group = to_add;
-        tail = to_add;
+        head = tail = group;
+      } else {
+        assert(tail != nullptr);
+        tail->next_group = group;
+        tail = group;
       }
+      return group;
+    }
 
-      // The tail group has the same epoch and has room
+    // Mark the given freeable item as deleted in the provided epoch
+    void MarkDeleted(Freeable freeable, epoch_t epoch) {
+      DeletionGroup* to_add = GetAvailableGroup(epoch);
+      assert(to_add != nullptr);
+      assert(to_add->epoch == epoch);
+      assert(to_add->num_items < kGroupSize);
       to_add->items[to_add->num_items++] = freeable;
     }
 
     // Free all deleted data before the given epoch
     void Free(epoch_t epoch) {
-      LOG_DEBUG("Freeing all data deleted before epoch %lu", epoch);
-      DeletionGroup* curr = head;
-      while (curr != nullptr) {
-        DeletionGroup* next = curr->next_group;
-        if (curr->epoch < epoch) {
-          // Invoke the tagged callback to delete every item in the group
-          for (uint32_t i = 0; i < curr->num_items; i++) {
-            curr->items[i].Free();
-          }
-          curr->next_group = free_to_use_groups;
-          free_to_use_groups = curr;
+      uint32_t freed = 0;
+      while (head != nullptr && head->epoch < epoch) {
+        DeletionGroup* next = head->next_group;
+        // All items in the head deletion group can be freed
+        for (uint32_t i = 0; i < head->num_items; i++, freed++) {
+          head->items[i].Free();
         }
-        curr = next;
+        // Add the deletion group to the free_to_use list
+        head->next_group = free_to_use_groups;
+        free_to_use_groups = head;
+        head = next;
+      }
+      if (freed > 0) {
+        LOG_DEBUG("Freed %u objects before epoch %lu", freed, epoch);
       }
     }
   };
@@ -128,8 +158,8 @@ class EpochManager {
   //       because we guarantee that all mutations are performed by
   //       a single thread (the thread whose state it represents)
   struct ThreadState {
-    bool initialized;
-    volatile epoch_t local_epoch;
+    bool initialized = false;
+    volatile epoch_t local_epoch = 0;
     DeletionList deletion_list;
     uint32_t added = 0;
     uint32_t deleted = 0;
@@ -155,31 +185,38 @@ class EpochManager {
   }
 
   void Init() {
-    epoch_mover_ = std::thread{[=]() {
-      LOG_DEBUG("Starting epoch incrementer thread");
-      std::chrono::milliseconds sleep_duration{kEpochTimer};
-      while (!stop_.load()) {
-        // Sleep
-        std::this_thread::sleep_for(sleep_duration);
-        // Increment global epoch
-        global_epoch_++;
-        {
-          // Find the lowest epoch number among active threads. Data with
-          // epoch < lowest can be deleted
-          std::lock_guard<std::mutex> lock{states_mutex_};
-          epoch_t lowest = std::numeric_limits<epoch_t>::max();
-          for (const auto& iter : thread_states_) {
-            ThreadState* state = iter.second;
-            if (state->local_epoch < lowest) {
-              lowest = state->local_epoch;
-            }
+    // Start the epoch ticker thread
+    epoch_mover_ = std::thread{&EpochManager::EpochTicker, this};
+  }
+
+  void EpochTicker() {
+    LOG_DEBUG("Starting epoch ticker thread");
+    std::chrono::milliseconds sleep_duration{kEpochTimer};
+    while (!stop_.load()) {
+      // Sleep
+      std::this_thread::sleep_for(sleep_duration);
+      // Increment global epoch
+      global_epoch_++;
+      uint32_t num_states = 0;
+      {
+        // Find the lowest epoch number among active threads. Data with
+        // epoch < lowest can be deleted
+        std::lock_guard<std::mutex> lock{states_mutex_};
+        num_states = thread_states_.size();
+        epoch_t lowest = global_epoch_.load();
+        for (const auto& iter : thread_states_) {
+          ThreadState* state = iter.second;
+          if (state->local_epoch < lowest) {
+            lowest = state->local_epoch;
           }
-          lowest_epoch_.store(lowest);
         }
-        LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu", global_epoch_.load(),
-                  lowest_epoch_.load());
+        lowest_epoch_.store(lowest);
       }
-    }};
+      LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu, # states: %u",
+                global_epoch_.load(), lowest_epoch_.load(), num_states);
+      assert(lowest_epoch_.load() <= global_epoch_.load());
+    }
+    LOG_DEBUG("Shutting down epoch ticker thread");
   }
 
   // Called by threads that want to enter the current epoch, indicating that
@@ -227,14 +264,15 @@ class EpochManager {
   }
 
  private:
-
   // The global epoch number
   std::atomic<epoch_t> global_epoch_;
   // The current minimum epoch that any transaction is in
   std::atomic<epoch_t> lowest_epoch_;
+
   // The thread that increments the epoch
   std::atomic<bool> stop_;
   std::thread epoch_mover_;
+
   // The map from threads to their states, and mutex that protects it
   std::mutex states_mutex_;
   std::unordered_map<std::thread::id, ThreadState*> thread_states_;

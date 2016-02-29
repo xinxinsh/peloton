@@ -17,6 +17,9 @@
 #include "backend/index/index_factory.h"
 #include "backend/storage/tuple.h"
 
+#include <chrono>
+#include <thread>
+
 namespace peloton {
 namespace test {
 
@@ -30,6 +33,8 @@ catalog::Schema *tuple_schema = nullptr;
 ItemPointer item0(120, 5);
 ItemPointer item1(120, 7);
 ItemPointer item2(123, 19);
+ItemPointer item3(125, 25);
+ItemPointer item4(130, 30);
 
 index::Index *BuildIndex() {
   // Build tuple and key schema
@@ -75,7 +80,6 @@ index::Index *BuildIndex() {
   return index;
 }
 
-
 TEST(IndexTests, BasicTest) {
   auto pool = TestingHarness::GetInstance().GetTestingPool();
   std::vector<ItemPointer> locations;
@@ -106,6 +110,89 @@ TEST(IndexTests, BasicTest) {
 
   locations = index->ScanKey(key0.get());
   EXPECT_EQ(locations.size(), 1);
+  EXPECT_EQ(locations[0].block, item0.block);
+
+  delete tuple_schema;
+}
+
+TEST(IndexTests, NonexistantKeyTest) {
+  auto pool = TestingHarness::GetInstance().GetTestingPool();
+  std::vector<ItemPointer> locations;
+
+  // INDEX
+  std::unique_ptr<index::Index> index(BuildIndex());
+
+  // Setup key
+  std::unique_ptr<storage::Tuple> key0(new storage::Tuple(key_schema, true));
+  key0->SetValue(0, ValueFactory::GetIntegerValue(100), pool);
+  key0->SetValue(1, ValueFactory::GetStringValue("a"), pool);
+
+  // Check
+  locations = index->ScanKey(key0.get());
+  EXPECT_EQ(locations.size(), 0);
+
+  delete tuple_schema;
+}
+
+TEST(IndexTests, ConsolidationTest) {
+  auto pool = TestingHarness::GetInstance().GetTestingPool();
+  std::vector<ItemPointer> locations;
+
+  // INDEX
+  std::unique_ptr<index::Index> index(BuildIndex());
+
+  // Setup key
+  std::unique_ptr<storage::Tuple> key0(new storage::Tuple(key_schema, true));
+  std::unique_ptr<storage::Tuple> key1(new storage::Tuple(key_schema, true));
+  std::unique_ptr<storage::Tuple> key2(new storage::Tuple(key_schema, true));
+  key0->SetValue(0, ValueFactory::GetIntegerValue(100), pool);
+  key0->SetValue(1, ValueFactory::GetStringValue("a"), pool);
+  key1->SetValue(0, ValueFactory::GetIntegerValue(200), pool);
+  key1->SetValue(1, ValueFactory::GetStringValue("b"), pool);
+  key2->SetValue(0, ValueFactory::GetIntegerValue(300), pool);
+  key2->SetValue(1, ValueFactory::GetStringValue("c"), pool);
+
+  // Insert 8 entries
+  std::vector<std::pair<storage::Tuple*, ItemPointer>> insertions = {
+   {key0.get(), item0}, {key0.get(), item1}, {key0.get(), item2}, {key0.get(), item3},
+   {key1.get(), item0}, {key1.get(), item1}, {key1.get(), item2}, {key1.get(), item3},
+   {key2.get(), item0}, {key2.get(), item1}, {key2.get(), item2}, {key2.get(), item3},
+  };
+  for (auto& kv : insertions) {
+    EXPECT_TRUE(index->InsertEntry(kv.first, kv.second));
+  }
+
+  // Check key0 and key1
+  locations = index->ScanKey(key0.get());
+  EXPECT_EQ(locations.size(), 4);
+  EXPECT_EQ(locations[0].block, item0.block);
+  EXPECT_EQ(locations[1].block, item1.block);
+  EXPECT_EQ(locations[2].block, item2.block);
+  EXPECT_EQ(locations[3].block, item3.block);
+
+  locations = index->ScanKey(key1.get());
+  EXPECT_EQ(locations.size(), 4);
+  EXPECT_EQ(locations[0].block, item0.block);
+  EXPECT_EQ(locations[1].block, item1.block);
+  EXPECT_EQ(locations[2].block, item2.block);
+  EXPECT_EQ(locations[3].block, item3.block);
+
+  // Delete two entries, creating a chain > 10 which will trigger consolidation
+  index->DeleteEntry(key0.get(), item0);
+  index->DeleteEntry(key0.get(), item1);
+  index->DeleteEntry(key0.get(), item2);
+
+  // Check key0 and key1
+  locations = index->ScanKey(key0.get());
+  EXPECT_EQ(locations.size(), 1);
+  //EXPECT_EQ(locations[0].block, item1.block);
+
+  // Sleep so that the epoch moves
+  std::chrono::milliseconds time{80};
+  std::this_thread::sleep_for(time);
+
+  locations = index->ScanKey(key1.get());
+  EXPECT_EQ(locations.size(), 4);
   EXPECT_EQ(locations[0].block, item0.block);
 
   delete tuple_schema;

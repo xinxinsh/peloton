@@ -138,7 +138,7 @@ class BWTree {
   //===--------------------------------------------------------------------===//
   struct Node {
     enum NodeType {
-      Inner,
+      Inner = 0,
       Leaf,
       DeltaInsert,
       DeltaDelete,
@@ -731,6 +731,9 @@ class BWTree {
     uint32_t slot = found_pos - vals.begin();
 
     LOG_DEBUG("Found key in leaf slot %d", slot);
+    if (result.node_to_consolidate != kInvalidPid) {
+      ConsolidateNode(result.node_to_consolidate);
+    }
 
     return Iterator{*this, slot, result.node_pid, result.node, std::move(vals)};
   }
@@ -1003,16 +1006,22 @@ class BWTree {
       chain_length++;
     }
 
-    LOG_DEBUG("Chain length of leaf-node is %u", chain_length);
+    LOG_DEBUG("FindInLeafNode: Node chain length is %u", chain_length);
 
-    // A true blue leaf, just binary search this guy
+    // We're at the base leaf, just binary search the guy
     LeafNode* leaf = static_cast<LeafNode*>(curr);
-    auto pos = std::lower_bound(leaf->keys, leaf->keys + leaf->num_entries,
-                                 key, key_comparator_);
-    uint32_t index = pos - leaf->keys;
-    bool found = index < leaf->num_entries &&
-        key_equals_(key, leaf->keys[index]) &&
-        value_comparator_.Compare(val, leaf->vals[index]);
+
+    // TODO: We need a key-value comparator so that we can use binary search
+    auto range = std::equal_range(leaf->keys, leaf->keys + leaf->num_entries,
+                                  key, key_comparator_);
+    bool found = false;
+    for (uint32_t i = range.first - leaf->keys, end = range.second - leaf->keys;
+         i < end; i++) {
+      if (value_comparator_.Compare(val, leaf->vals[i])) {
+        found = true;
+        break;
+      }
+    }
     return std::make_tuple(found, chain_length >= chain_length_threshold,
         split_pid, split_node);
   }
@@ -1099,9 +1108,6 @@ class BWTree {
       chain_length++;
     }
 
-    LOG_DEBUG(
-        "CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d",
-        inserted.size(), deleted.size(), chain_length + 1);
 
     // Curr now points to the base inner node
     InnerNode* inner = static_cast<InnerNode*>(curr);
@@ -1115,17 +1121,17 @@ class BWTree {
       output.push_back(merged[i]);
     }
 
+    LOG_DEBUG(
+        "CollpaseInnerNode: Found %lu inserted, %lu deleted, chain length %d, "
+        "base page size %lu" ,
+        inserted.size(), deleted.size(), chain_length + 1, output.size());
+
     // Remove all entries that have been split away from this node
     if (stop_key != nullptr) {
-      LOG_DEBUG("Collapsed size before removing split data: %lu",
-                output.size());
       auto pos = std::lower_bound(output.begin(), output.end(), *stop_key, cmp);
       assert(pos != output.end());
       output.erase(pos, output.end());
     }
-
-    LOG_DEBUG("Collapsed size before insertions and deletes: %lu",
-              output.size());
 
     // Add inserted key-value pairs from the delta chain
     for (uint32_t i = 0; i < inserted.size(); i++) {
@@ -1133,8 +1139,6 @@ class BWTree {
           std::lower_bound(output.begin(), output.end(), inserted[i], cmp);
       output.insert(pos, inserted[i]);
     }
-
-    LOG_DEBUG("Collapsed size after insertions: %lu", output.size());
 
     // Remove deleted key-value pairs from the delta chain
     for (uint32_t i = 0; i < deleted.size(); i++) {
@@ -1241,10 +1245,6 @@ class BWTree {
       chain_length++;
     }
 
-    LOG_DEBUG(
-        "CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d",
-        inserted.size(), deleted.size(), chain_length + 1);
-
     // Curr now points to a true blue leaf node
     LeafNode* leaf = static_cast<LeafNode*>(curr);
     KeyOnlyComparator cmp{key_comparator_};
@@ -1264,8 +1264,10 @@ class BWTree {
       output.erase(pos, output.end());
     }
 
-    LOG_DEBUG("Collapsed size before insertions and deletes: %lu",
-              output.size());
+    LOG_DEBUG(
+        "CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d, "
+        "base page size %lu" ,
+        inserted.size(), deleted.size(), chain_length + 1, output.size());
 
     // Add inserted key-value pairs from the delta chain
     for (uint32_t i = 0; i < inserted.size(); i++) {
@@ -1273,8 +1275,6 @@ class BWTree {
           std::lower_bound(output.begin(), output.end(), inserted[i], cmp);
       output.insert(pos, inserted[i]);
     }
-
-    LOG_DEBUG("Collapsed size after insertions: %lu", output.size());
 
     // Remove deleted key-value pairs from the delta chain
     for (uint32_t i = 0; i < deleted.size(); i++) {
@@ -1318,8 +1318,6 @@ class BWTree {
     Node* node = nullptr;
     InnerNode* consolidated = nullptr;
     do {
-      LOG_DEBUG("Consolidating inner-node %lu. Attempt %u", node_pid, attempt++);
-
       // Get the current node
       node = GetNode(node_pid);
       if (IsDeleted(node)) {
@@ -1331,6 +1329,9 @@ class BWTree {
                   node_pid);
         return;
       }
+
+      LOG_DEBUG("Consolidating inner-node %lu (%p). Attempt %u",
+                node_pid, node, attempt++);
 
       // Consolidate data
       std::vector<std::pair<KeyType, pid_t>> vals;
@@ -1348,6 +1349,8 @@ class BWTree {
     // Mark the node as deleted
     assert(node != nullptr);
     epoch_manager_.MarkDeleted(NodeDeleter{this, node});
+    LOG_DEBUG("Inner-node %lu consolidation successful, marking for deletion",
+              node_pid);
   }
 
   void ConsolidateLeafNode(pid_t node_pid) {
@@ -1355,8 +1358,6 @@ class BWTree {
     Node* node = nullptr;
     LeafNode* consolidated = nullptr;
     do {
-      LOG_DEBUG("Consolidating leaf-node %lu. Attempt %u", node_pid, attempt++);
-
       // Get the current node
       node = GetNode(node_pid);
       if (IsDeleted(node)) {
@@ -1368,6 +1369,9 @@ class BWTree {
                   node_pid);
         return;
       }
+
+      LOG_DEBUG("Consolidating leaf-node %lu (%p). Attempt %u",
+                node_pid, node, attempt++);
 
       // Consolidate data
       std::vector<std::pair<KeyType, ValueType>> vals;
@@ -1385,6 +1389,8 @@ class BWTree {
     // Mark the node as deleted
     assert(node != nullptr);
     epoch_manager_.MarkDeleted(NodeDeleter{this, node});
+    LOG_DEBUG("Leaf %lu (%p) consolidation complete, marking for deletion",
+              node_pid, node);
   }
 
   InnerNode* GetInner(Node* node) {
@@ -1638,23 +1644,23 @@ class BWTree {
 
   // Delete the memory for this node's delta chain and base node
   void FreeNode(Node* node) {
+    LOG_DEBUG("Freeing node (%p)", node);
     uint32_t chain_length = 0;
     Node* curr = node;
-    while (curr->node_type != Node::NodeType::Inner ||
+    while (curr->node_type != Node::NodeType::Inner &&
            curr->node_type != Node::NodeType::Leaf) {
-      // Curr is a delta node since it isn't a base inner or base leaf node
       DeltaNode* delta = static_cast<DeltaNode*>(curr);
-      // Save the next link on the chain
-      Node* next = delta->next;
-      // Delete the node
-      delete curr;
-      // Move along
-      curr = next;
+      curr = delta->next;
+      delete delta;
       chain_length++;
     }
-    LOG_DEBUG("Freed node of type %d with chain length of %u", curr->node_type,
-              chain_length);
+    auto node_type = curr->node_type;
+
+    // Delete the base node
     delete curr;
+
+    LOG_DEBUG("Freed node (%p) type %d with chain length of %u",
+              node, node_type, chain_length);
   }
 
  private:

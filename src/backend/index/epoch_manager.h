@@ -26,10 +26,25 @@ namespace index {
 
 //===--------------------------------------------------------------------===//
 // The epoch manager tracks epochs in the system and arranges for memory
-// reclamation at safe points. There is no global GC, but rather, each thread
-// uses information about it's own epoch, the current epoch and lowest
-// epoch that a thread is current in to determine whether memory it has
-// marked as deleted can actually be physically deleted.
+// reclamation at safe points. There is no global GC thread, but rather each
+// thread performs GC on data items it has deleted.
+//
+// There is a global epoch timer that is updated at kEpochTimer (ms) intervals
+// by a dedicated epoch ticker thread.  In addition to moving the epoch, this
+// thread also discovers the lowest active epoch amongst all threads that have
+// registered with this manager.
+//
+// Every thread has state (ThreadState) that tracks the current epoch it is in.
+// Most importantly, this state also tracks all items that have been marked
+// deleted by the thread.  This information is stored in a linked list of
+// DeletionGroups. A deletion group just represents a collection of items that
+// have been marked as garbage in the same epoch.  Because epochs increase
+// monotonically, it can be guaranteed that the head of the deletion list
+// has a lower epoch that those groups towards the tail of the list.
+//
+// When a thread exits an epoch, it uses the lowest epoch variable that is
+// updated by the ticker thread to determine the items that can be safely
+// freed. A thread only ever frees deleted items it marked itself.
 //===--------------------------------------------------------------------===//
 template <class Freeable>
 class EpochManager {
@@ -108,6 +123,7 @@ class EpochManager {
       return group;
     }
 
+    // Mark the given freeable item as deleted in the provided epoch
     void MarkDeleted(Freeable freeable, epoch_t epoch) {
       DeletionGroup* to_add = GetAvailableGroup(epoch);
       assert(to_add != nullptr);
@@ -248,14 +264,15 @@ class EpochManager {
   }
 
  private:
-
   // The global epoch number
   std::atomic<epoch_t> global_epoch_;
   // The current minimum epoch that any transaction is in
   std::atomic<epoch_t> lowest_epoch_;
+
   // The thread that increments the epoch
   std::atomic<bool> stop_;
   std::thread epoch_mover_;
+
   // The map from threads to their states, and mutex that protects it
   std::mutex states_mutex_;
   std::unordered_map<std::thread::id, ThreadState*> thread_states_;

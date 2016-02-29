@@ -14,6 +14,7 @@
 
 #include "backend/common/logger.h"
 #include "backend/index/epoch_manager.h"
+#include "backend/index/index_key.h"
 
 #include <algorithm>
 #include <atomic>
@@ -639,6 +640,7 @@ class BWTree {
 
     } while (!mapping_table_.Cas(node_pid, prev_root, delta_insert));
     if (num_entries > insert_branch_factor) {
+      LOG_DEBUG("Splitting since num_entries: %d for node %lu", num_entries, node_pid);
       Split(node_pid, parent_search_keys, false);
     }
     if (node_to_consolidate != kInvalidPid) {
@@ -648,6 +650,7 @@ class BWTree {
     }
 
     if (inner_node_to_split != kInvalidPid) {
+      LOG_DEBUG("Splitting inner node %lu", inner_node_to_split);
       Split(inner_node_to_split, parent_search_keys, true);
     }
 
@@ -768,6 +771,7 @@ class BWTree {
     pid_t last_inner_node = kInvalidPid;
     while (true) {
       assert(curr != kInvalidPid);
+      LOG_DEBUG("curr is %lu", curr);
       Node* curr_node = GetNode(curr);
       if (IsLeaf(curr_node)) {
         // The node we're at is a leaf. If the leaf has been deleted (due to a
@@ -982,6 +986,7 @@ class BWTree {
             delta_index->high_key = split->high_key;
             delta_index->new_child_pid = split->new_child_pid;
             delta_index->is_rightmost = split->is_rightmost;
+            delta_index->node_type = Node::NodeType::DeltaSplitInner;
             InstallDeltaIndex(split->orig_left_pid, delta_index, false);
             split_pid = split->new_right;
             curr = GetNode(split->new_right);
@@ -1028,7 +1033,8 @@ class BWTree {
     pid_t right_sibling = kInvalidPid;
     KeyType* stop_key = nullptr;
     Node* curr = node;
-    while (curr->node_type != Node::NodeType::Leaf) {
+    LOG_DEBUG("curr %p", curr);
+    while (curr->node_type != Node::NodeType::Inner) {
       switch (curr->node_type) {
         case Node::NodeType::DeltaIndex: {
           DeltaIndex* index = static_cast<DeltaIndex*>(curr);
@@ -1405,6 +1411,7 @@ class BWTree {
     Node* node = nullptr;
     KeyType split_key;
     pid_t sibling_pid;
+    LOG_DEBUG("Split called with node %lu", node_pid);
     do {
       //TODO: add delete logic for mapping table
       // Get the current node
@@ -1461,6 +1468,7 @@ class BWTree {
         delta_split->new_right = sibling_pid;
         delta_split->node_type = Node::NodeType::DeltaSplit;
         delta_split->num_entries = kv_vec.size() - kv_split_vec.size();
+        LOG_DEBUG("Splitting leaf node with left node size %d right node size %lu", delta_split->num_entries, kv_split_vec.size());
         delta_split->next = node;
         cas_node = delta_split;
       } else {
@@ -1478,6 +1486,7 @@ class BWTree {
         pid_t right_link = GetInner(node)->right_link;
 
         InnerNode *right_sibling = InnerNode::Create(low_key, high_key, right_link, left_link, kv_split_vec.size());
+        LOG_DEBUG("Splitting inner node with new size %lu", kv_split_vec.size());
         int i = 0;
         for (auto it = std::make_move_iterator(kv_split_vec.begin()),
                      end = std::make_move_iterator(kv_split_vec.end()); it != end; ++it) {
@@ -1500,20 +1509,17 @@ class BWTree {
       if (cas_succ) break;
       delete cas_node;
     } while (true);
-
     DeltaIndex* delta_index = new DeltaIndex();
     delta_index->node_type = Node::NodeType::DeltaIndex;
     delta_index->low_key = split_key;
     delta_index->new_child_pid = sibling_pid;
+    LOG_DEBUG("CAS SUCCESSFUL! new delta index has new_child_pid %lu", delta_index->new_child_pid);
     if (parent_search_keys.empty()) {
       //This can't happen for inner splits
       delta_index->is_rightmost = true;
     } else {
       if (is_inner) {
-        if (parent_search_keys.size() == 1) {
-          //we are splitting root
-          delta_index->new_child_pid = kInvalidPid;          
-        } else {
+        if (parent_search_keys.size() != 1) {
           parent_search_keys.pop();
           delta_index->high_key = parent_search_keys.top();
         }
@@ -1526,6 +1532,7 @@ class BWTree {
 
   void InstallDeltaIndex(pid_t orig_left, DeltaIndex* delta_index, bool is_inner)  {
     Node* node = nullptr;
+    LOG_DEBUG("Installing delta index for is_inner: %d orig_left: %lu newright %lu", is_inner, orig_left, delta_index->new_child_pid);
     do {
       //orig_left was root
       pid_t parent; FindDataNodeResult result;
@@ -1535,12 +1542,15 @@ class BWTree {
         if (result.traversal_path.size() == 1) {
           //Splitting root
           parent = kInvalidPid;
+          LOG_DEBUG("Splitting orig_left %lu which was root", orig_left);
         } else {
           result.traversal_path.pop();
           parent = result.traversal_path.top();
+          LOG_DEBUG("Splitting orig_left %lu which was not root whose parent is %lu", orig_left, parent);
         }
       }
       if (parent == kInvalidPid) {
+        LOG_DEBUG("Installing delta index for root orig_left %lu", orig_left);
         //TODO what should the high key be here?
         InnerNode* inner = InnerNode::Create(delta_index->low_key, delta_index->high_key, kInvalidPid, kInvalidPid, 1);
         inner->keys[0] = delta_index->low_key;
@@ -1549,6 +1559,7 @@ class BWTree {
         pid_t new_root_pid = pid_allocator_++;
         mapping_table_.Insert(new_root_pid, inner);
         if (root_pid_.compare_exchange_weak(orig_left, new_root_pid)) {
+          LOG_DEBUG("Installing new root successful! new root pid is now %lu with innernode at %p with left child %lu right child %lu", new_root_pid, inner, inner->children[0], inner->children[1]);
           break;
         } else {
           delete inner;
@@ -1571,7 +1582,8 @@ class BWTree {
         }
         //TODO: figure out if this needs to be prev_node.num_entries + 1
         delta_index->num_entries = output.size() + 1;
-        bool cas_succ = mapping_table_.Cas(result.last_inner_node, node, delta_index);
+        delta_index->next = node;
+        bool cas_succ = mapping_table_.Cas(parent, node, delta_index);
         if (cas_succ) break;
       }
     } while(true);
@@ -1678,7 +1690,7 @@ class BWTree {
 
   // TODO: just a randomly chosen number now...
   uint32_t delete_branch_factor = 100;
-  uint32_t insert_branch_factor = 500;
+  uint32_t insert_branch_factor = 1;
   uint32_t chain_length_threshold = 10;
 
   std::atomic<uint64_t> num_failed_cas_;

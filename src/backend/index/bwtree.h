@@ -1035,7 +1035,7 @@ class BWTree {
     }
 
     LOG_DEBUG(
-        "CollapseLeafData: Found %lu inserted, %lu deleted, chain length %d, "
+        "CollpaseInnerNode: Found %lu inserted, %lu deleted, chain length %d, "
         "base page size %lu" ,
         inserted.size(), deleted.size(), chain_length + 1, output.size());
 

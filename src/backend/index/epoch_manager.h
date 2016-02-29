@@ -74,31 +74,43 @@ class EpochManager {
       }
     }
 
-    void MarkDeleted(Freeable freeable, epoch_t epoch) {
-      DeletionGroup* to_add = nullptr;
+    // Get a deletion group with sufficient space for items deleted in
+    // the given eopch
+    // TODO: Does it really have to be the same epoch?
+    DeletionGroup* GetAvailableGroup(epoch_t epoch) {
+      if (tail != nullptr && tail->epoch == epoch &&
+          tail->num_items < kGroupSize - 1) {
+        return tail;
+      }
+
+      // Either the tail is null, or has a different epoch or has no room
+      // for new entries.  In any case, we need a new fresh group
+
+      DeletionGroup* group = nullptr;
+      if (free_to_use_groups != nullptr) {
+        group = free_to_use_groups;
+        free_to_use_groups = free_to_use_groups->next_group;
+      } else {
+        group = new DeletionGroup();
+      }
+      group->epoch = epoch;
+      group->num_items = 0;
+      group->next_group = nullptr;
 
       if (head == nullptr) {
         assert(tail == nullptr);
-        to_add = new DeletionGroup();
-        to_add->epoch = epoch;
-        to_add->num_items = 0;
-        to_add->next_group = nullptr;
-        tail = head = to_add;
-      } else if (tail->epoch != epoch || tail->num_items >= kGroupSize) {
-        if (free_to_use_groups != nullptr) {
-          to_add = free_to_use_groups;
-          free_to_use_groups = free_to_use_groups->next_group;
-        } else {
-          to_add = new DeletionGroup();
-        }
-        to_add->epoch = epoch;
-        to_add->num_items = 0;
-        to_add->next_group = nullptr;
-        tail->next_group = to_add;
-        tail = to_add;
+        head = tail = group;
+      } else {
+        assert(tail != nullptr);
+        tail->next_group = group;
+        tail = group;
       }
+      return group;
+    }
 
-      // The tail group has the same epoch and has room
+    void MarkDeleted(Freeable freeable, epoch_t epoch) {
+      DeletionGroup* to_add = GetAvailableGroup(epoch);
+      assert(to_add != nullptr);
       assert(to_add->epoch == epoch);
       assert(to_add->num_items < kGroupSize);
       to_add->items[to_add->num_items++] = freeable;

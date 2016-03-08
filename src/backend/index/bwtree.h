@@ -375,6 +375,7 @@ class BWTree {
                               pid_t new_child_pid, uint32_t num_entries,
                               Node* next) {
       auto* index = new DeltaIndex();
+      index->node_type = Node::NodeType::DeltaIndex;
       index->low_key = low_key;
       index->high_key = high_key;
       index->new_child_pid = new_child_pid;
@@ -690,7 +691,7 @@ class BWTree {
 
       if (!traversal.empty()) {
         bool found_left = false;
-        for (uint32_t i = traversal.size() - 1; i >= 0; i--) {
+        for (int32_t i = traversal.size() - 1; i >= 0; i--) {
           if (found_left) {
             if (!IsDeleted(GetNode(traversal[i].first))) {
               parent_pid = traversal[i].first;
@@ -722,8 +723,8 @@ class BWTree {
           // Successfully CASed in a new root
           LOG_DEBUG(
               "New root [%lu] created with left child [%lu] and right "
-              "child [%lu]",
-              new_root_pid, left_pid, right_pid);
+              "child [%lu] (i.e., num_entries = %u)",
+              new_root_pid, left_pid, right_pid, new_root->num_entries);
           break;
         }
 
@@ -732,7 +733,7 @@ class BWTree {
         delete new_root;
 
       } else {
-        LOG_DEBUG("Parent of node %lu is %lu. We'll install the delta on it.",
+        LOG_DEBUG("Parent of [%lu] is [%lu]. We'll install the delta on it.",
                   left_pid, parent_pid);
 
         // Before inserting the delta, check if some other thread snuck in and
@@ -746,6 +747,7 @@ class BWTree {
           if (KeyEqual(low_key, entries[i].first) &&
               left_pid == entries[i].second) {
             // Someone inserted the delta index term already, we don't have to
+            LOG_DEBUG("Another thread inserted the delta index node. Skipping");
             return;
           }
         }
@@ -755,10 +757,16 @@ class BWTree {
                                          NodeSize(parent) + 1, parent);
         if (mapping_table_.Cas(parent_pid, parent, index)) {
           // Successful Cas
+          LOG_DEBUG(
+              "Successfully CASed delta index entry into [%lu]. "
+              "Previous was (%p), new is (%p)",
+              parent_pid, parent, index);
           break;
         }
 
         // Failed CAS, retry
+        LOG_DEBUG("CAS failed to install delta index into [%lu], retrying",
+                  parent_pid);
         delete index;
       }
     }
@@ -1080,7 +1088,6 @@ class BWTree {
     pid_t node_to_consolidate = kInvalidPid;
     // The PID of the node we're currently probing
     pid_t curr = root_pid_.load();
-    LOG_DEBUG("Starting at root [%lu]", curr);
     while (true) {
       assert(curr != kInvalidPid);
       Node* curr_node = GetNode(curr);
@@ -1095,6 +1102,7 @@ class BWTree {
         if (!IsDeleted(curr_node)) {
           // We've found the leaf
           LOG_DEBUG("Found [%lu] leaf node", curr);
+          traversal.emplace_back(curr, KeyType());
           break;
         }
         curr = traversal.back().first;
@@ -1102,6 +1110,7 @@ class BWTree {
       } else {
         // Is an inner node, perform a search for the key in the inner node,
         // return the PID of the next node to go go
+        LOG_DEBUG("Checking node [%lu] (%p)", curr, curr_node);
         auto search_result = FindInInnerNode(curr, key, traversal);
         pid_t child = search_result.child;
 
@@ -1144,6 +1153,7 @@ class BWTree {
     uint32_t chain_length = 0;
     const Node* curr_node = node;
     while (curr_node->node_type != Node::NodeType::Inner) {
+      chain_length++;
       switch (curr_node->node_type) {
         case Node::NodeType::DeltaMergeInner: {
           const auto* merge = static_cast<const DeltaMerge*>(curr_node);
@@ -1176,7 +1186,12 @@ class BWTree {
           const auto* index = static_cast<const DeltaIndex*>(curr_node);
           if (KeyLess(index->low_key, key) &&
               KeyLessEqual(key, index->high_key)) {
-            curr_node = GetNode(index->new_child_pid);
+            FindInnerNodeResult result;
+            result.low_separator = index->low_key;
+            result.high_separator = index->high_key;
+            result.child = index->new_child_pid;
+            result.needs_consolidation = chain_length >= chain_length_threshold;
+            return result;
           } else {
             curr_node = index->next;
           }
@@ -1200,20 +1215,23 @@ class BWTree {
           result.needs_consolidation = chain_length >= chain_length_threshold;
           return result;
         }
+        case Node::NodeType::Leaf: {
+          LOG_DEBUG("WTF Leaf?!");
+        }
         default: {
           // Anything else should be impossible for inner nodes
-          LOG_DEBUG("Hit node %s on inner node traversal. This is impossible!",
+          LOG_DEBUG("Hit node type %s on inner node traversal. This is impossible!",
                     std::to_string(curr_node->node_type).c_str());
           assert(false);
         }
       }
-      chain_length++;
     }
 
-    LOG_DEBUG("Chain length for inner-node was %u", chain_length);
+    LOG_DEBUG("Chain length for inner-node [%lu] is %u", node_pid, chain_length);
 
     // Curr now points to the base inner node
     const auto* inner = static_cast<const InnerNode*>(curr_node);
+    LOG_DEBUG("Base inner node [%lu] size: %u", node_pid, inner->num_entries);
     auto iter = std::lower_bound(inner->keys, inner->keys + inner->num_entries,
                                  key, key_comparator_);
     uint32_t child_index = iter - inner->keys;
@@ -1319,7 +1337,7 @@ class BWTree {
 
     std::stack<Node*, std::vector<Node*>> chain;
     Node* curr = node;
-    while (curr->node_type != Node::NodeType::Leaf) {
+    while (curr->node_type != Node::NodeType::Inner) {
       auto* delta = static_cast<DeltaNode*>(curr);
       chain.push(delta);
       curr = delta->next;
@@ -1334,6 +1352,7 @@ class BWTree {
       output.emplace_back(inner->keys[i], inner->children[i]);
     }
     output.emplace_back(KeyType(), inner->children[inner->num_entries]);
+    uint32_t base_size = output.size();
 
     pid_t left_sibling = inner->left_link;
     pid_t right_sibling = inner->right_link;
@@ -1383,8 +1402,8 @@ class BWTree {
 
     LOG_DEBUG(
         "CollapseInnerData: Found %u inserted, %u deleted, chain length %u, "
-        "base page size %lu",
-        inserted, deleted, chain_length + 1, output.size());
+        "base page size %u, size after insertions/deletions/splits/merges %lu",
+        inserted, deleted, chain_length + 1, base_size - 1, output.size() - 1);
     assert(std::is_sorted(output.begin(), output.end(), cmp));
 #ifndef NDEBUG
     // Make sure the output is sorted by keys and contains no duplicate
@@ -1564,6 +1583,7 @@ class BWTree {
     for (uint32_t i = 0; i < leaf->num_entries; i++) {
       output.push_back(std::make_pair(leaf->keys[i], leaf->vals[i]));
     }
+    uint32_t base_size = output.size();
 
     pid_t left_sibling = leaf->left_link;
     pid_t right_sibling = leaf->right_link;
@@ -1618,8 +1638,8 @@ class BWTree {
     }
     LOG_DEBUG(
         "CollapseLeafData: Found %u inserted, %u deleted, chain length %u, "
-        "base page size %lu",
-        inserted, deleted, chain_length + 1, output.size());
+        "base page size %u, size after insertions/deletions/splits/merges %lu",
+        inserted, deleted, chain_length + 1, base_size, output.size());
     assert(std::is_sorted(output.begin(), output.end(), cmp));
 #ifndef NDEBUG
     // Make sure the output is sorted by keys and contains no duplicate
@@ -1922,8 +1942,9 @@ class BWTree {
   // Return the size (i.e., the number of key-value or key-pid pairs) in this
   // logical node
   uint32_t NodeSize(const Node* node) const {
-    if (node->node_type == Node::NodeType::Leaf) {
-      return static_cast<const LeafNode*>(node)->num_entries;
+    if (node->node_type == Node::NodeType::Leaf ||
+        node->node_type == Node::NodeType::Inner) {
+      return static_cast<const DataNode*>(node)->num_entries;
     } else {
       return static_cast<const DeltaNode*>(node)->num_entries;
     }

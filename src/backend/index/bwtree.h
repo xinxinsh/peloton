@@ -519,9 +519,9 @@ class BWTree {
     // The comparator
     KeyComparator cmp;
 
-    bool operator()(const std::pair<KeyType, ValueType>& first,
-                    const std::pair<KeyType, ValueType>& second) const {
-      return cmp(first.first, second.first);
+    bool operator()(const std::pair<KeyType, ValueType>& lhs,
+                    const std::pair<KeyType, ValueType>& rhs) const {
+      return cmp(lhs.first, rhs.first);
     }
 
     bool operator()(const std::pair<KeyType, ValueType>& lhs,
@@ -534,9 +534,9 @@ class BWTree {
       return cmp(lhs, rhs.first);
     }
 
-    bool operator()(const std::pair<KeyType, pid_t>& first,
-                    const std::pair<KeyType, pid_t>& second) const {
-      return cmp(first.first, second.first);
+    bool operator()(const std::pair<KeyType, pid_t>& lhs,
+                    const std::pair<KeyType, pid_t>& rhs) const {
+      return cmp(lhs.first, rhs.first);
     }
 
     bool operator()(const std::pair<KeyType, pid_t>& lhs,

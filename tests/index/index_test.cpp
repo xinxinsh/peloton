@@ -154,9 +154,9 @@ TEST(IndexTests, ConsolidationTest) {
 
   // Insert 8 entries
   std::vector<std::pair<storage::Tuple*, ItemPointer>> insertions = {
-   {key0.get(), item0}, {key0.get(), item1}, {key0.get(), item2}, {key0.get(), item3},
-   {key1.get(), item0}, {key1.get(), item1}, {key1.get(), item2}, {key1.get(), item3},
-   {key2.get(), item0}, {key2.get(), item1}, {key2.get(), item2}, {key2.get(), item3},
+    {key0.get(), item0}, {key0.get(), item1}, {key0.get(), item2}, {key0.get(), item3},
+    {key1.get(), item0}, {key1.get(), item1}, {key1.get(), item2}, {key1.get(), item3},
+    {key2.get(), item0}, {key2.get(), item1}, {key2.get(), item2}, {key2.get(), item3},
   };
   for (auto& kv : insertions) {
     EXPECT_TRUE(index->InsertEntry(kv.first, kv.second));
@@ -165,17 +165,9 @@ TEST(IndexTests, ConsolidationTest) {
   // Check key0 and key1
   locations = index->ScanKey(key0.get());
   EXPECT_EQ(locations.size(), 4);
-  EXPECT_EQ(locations[0].block, item0.block);
-  EXPECT_EQ(locations[1].block, item1.block);
-  EXPECT_EQ(locations[2].block, item2.block);
-  EXPECT_EQ(locations[3].block, item3.block);
 
   locations = index->ScanKey(key1.get());
   EXPECT_EQ(locations.size(), 4);
-  EXPECT_EQ(locations[0].block, item0.block);
-  EXPECT_EQ(locations[1].block, item1.block);
-  EXPECT_EQ(locations[2].block, item2.block);
-  EXPECT_EQ(locations[3].block, item3.block);
 
   // Delete two entries, creating a chain > 10 which will trigger consolidation
   index->DeleteEntry(key0.get(), item0);
@@ -193,7 +185,6 @@ TEST(IndexTests, ConsolidationTest) {
 
   locations = index->ScanKey(key1.get());
   EXPECT_EQ(locations.size(), 4);
-  EXPECT_EQ(locations[0].block, item0.block);
 
   delete tuple_schema;
 }

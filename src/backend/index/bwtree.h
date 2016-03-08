@@ -616,8 +616,9 @@ class BWTree {
         } else {
           LOG_DEBUG("Moving right to next tree node [%lu]", node_pid_);
           curr_idx_ = 0;
+          node_ = tree_.GetNode(node_pid_);
           collapsed_contents_.clear();
-          tree_.CollapseLeafData(tree_.GetNode(node_pid_), collapsed_contents_);
+          tree_.CollapseLeafData(node_, collapsed_contents_);
         }
       }
       return *this;

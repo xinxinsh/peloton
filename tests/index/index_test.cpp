@@ -134,6 +134,48 @@ TEST(IndexTests, NonexistantKeyTest) {
   delete tuple_schema;
 }
 
+TEST(IndexTests, SplitTest) {
+  auto pool = TestingHarness::GetInstance().GetTestingPool();
+
+  // INDEX
+  std::unique_ptr<index::Index> index(BuildIndex());
+
+  // Setup key
+  std::unique_ptr<storage::Tuple> key0(new storage::Tuple(key_schema, true));
+  std::unique_ptr<storage::Tuple> key1(new storage::Tuple(key_schema, true));
+  std::unique_ptr<storage::Tuple> key2(new storage::Tuple(key_schema, true));
+  std::unique_ptr<storage::Tuple> key3(new storage::Tuple(key_schema, true));
+  std::unique_ptr<storage::Tuple> key4(new storage::Tuple(key_schema, true));
+
+  key0->SetValue(0, ValueFactory::GetIntegerValue(100), pool);
+  key0->SetValue(1, ValueFactory::GetStringValue("a"), pool);
+  key1->SetValue(0, ValueFactory::GetIntegerValue(200), pool);
+  key1->SetValue(1, ValueFactory::GetStringValue("b"), pool);
+  key2->SetValue(0, ValueFactory::GetIntegerValue(300), pool);
+  key2->SetValue(1, ValueFactory::GetStringValue("c"), pool);
+  key3->SetValue(0, ValueFactory::GetIntegerValue(400), pool);
+  key3->SetValue(1, ValueFactory::GetStringValue("d"), pool);
+  key4->SetValue(0, ValueFactory::GetIntegerValue(500), pool);
+  key4->SetValue(1, ValueFactory::GetStringValue("e"), pool);
+
+  // Insert 20 entries
+  std::vector<std::pair<storage::Tuple*, ItemPointer>> insertions = {
+    {key0.get(), item0}, {key0.get(), item1}, {key0.get(), item2}, {key0.get(), item3},
+    {key1.get(), item0}, {key1.get(), item1}, {key1.get(), item2}, {key1.get(), item3},
+    {key2.get(), item0}, {key2.get(), item1}, {key2.get(), item2}, {key2.get(), item3},
+    {key3.get(), item0}, {key3.get(), item1}, {key3.get(), item2}, {key3.get(), item3},
+    {key4.get(), item0}, {key4.get(), item1}, {key4.get(), item2}, {key4.get(), item3},
+  };
+  for (auto& kv : insertions) {
+    EXPECT_TRUE(index->InsertEntry(kv.first, kv.second));
+  }
+
+  std::vector<ItemPointer> locations = index->ScanAllKeys();
+  EXPECT_EQ(locations.size(), 20);
+
+  delete tuple_schema;
+}
+
 TEST(IndexTests, ConsolidationTest) {
   auto pool = TestingHarness::GetInstance().GetTestingPool();
   std::vector<ItemPointer> locations;

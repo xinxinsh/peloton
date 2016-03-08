@@ -549,6 +549,15 @@ class BWTree {
     }
   };
 
+  struct KeyPidComparator {
+    KeyComparator cmp;
+
+    bool operator()(const std::pair<KeyType, pid_t>& lhs,
+                    const std::pair<KeyType, pid_t>& rhs) const {
+      return cmp(lhs.first, rhs.first) && lhs.second < rhs.second;
+    }
+  };
+
   //===--------------------------------------------------------------------===//
   // This is the struct that we use when we mark nodes as deleted.  The epoch
   // manager invokes the Free(...) callback when the given data can be deleted.
@@ -1307,6 +1316,93 @@ class BWTree {
       Node* node, std::vector<std::pair<KeyType, pid_t>>& output) const {
     assert(node != nullptr);
     assert(!IsLeaf(node));
+
+    std::stack<Node*, std::vector<Node*>> chain;
+    Node* curr = node;
+    while (curr->node_type != Node::NodeType::Leaf) {
+      auto* delta = static_cast<DeltaNode*>(curr);
+      chain.push(delta);
+      curr = delta->next;
+    }
+
+    // Curr now points to the base inner
+    InnerNode* inner = static_cast<InnerNode*>(curr);
+    KeyPidComparator cmp{key_comparator_};
+
+    // Put all inner data into the output vector
+    for (uint32_t i = 0; i < inner->num_entries; i++) {
+      output.emplace_back(inner->keys[i], inner->children[i]);
+    }
+    output.emplace_back(KeyType(), inner->children[inner->num_entries]);
+
+    pid_t left_sibling = inner->left_link;
+    pid_t right_sibling = inner->right_link;
+    uint32_t deleted = 0;
+    uint32_t inserted = 0;
+    uint32_t chain_length = 0;
+    // Process delta chain backwards
+    while (!chain.empty()) {
+      DeltaNode* delta = static_cast<DeltaNode*>(chain.top());
+      chain.pop();
+      chain_length++;
+      switch (delta->node_type) {
+        case Node::NodeType::DeltaIndex: {
+          DeltaIndex* index = static_cast<DeltaIndex*>(delta);
+          std::pair<KeyType, pid_t> kv{index->low_key, index->new_child_pid};
+          auto pos = std::lower_bound(output.begin(), output.end(), kv, cmp);
+          output.insert(pos, kv);
+          inserted++;
+          break;
+        }
+        case Node::NodeType::DeltaDeleteIndex: {
+          DeltaDeleteIndex* del = static_cast<DeltaDeleteIndex*>(delta);
+          std::pair<KeyType, pid_t> kv{del->deleted_key, del->deleted_pid};
+          auto pos = std::lower_bound(output.begin(), output.end(), kv, cmp);
+          output.erase(pos);
+          deleted++;
+          break;
+        }
+        case Node::NodeType::DeltaMergeInner: {
+          DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
+          CollapseInnerNodeData(merge->old_right, output);
+          break;
+        }
+        case Node::NodeType::DeltaSplitInner: {
+          DeltaSplit* split = static_cast<DeltaSplit*>(curr);
+          output.erase(output.begin() + split->num_entries, output.end());
+          right_sibling = split->new_right;
+          break;
+        }
+        default: {
+          LOG_DEBUG("Hit node type %s when collapsing inner node. This is bad.",
+                    std::to_string(delta->node_type).c_str());
+          assert(false);
+        }
+      }
+    }
+
+    LOG_DEBUG(
+        "CollapseInnerData: Found %u inserted, %u deleted, chain length %u, "
+        "base page size %lu",
+        inserted, deleted, chain_length + 1, output.size());
+    assert(std::is_sorted(output.begin(), output.end(), cmp));
+#ifndef NDEBUG
+    // Make sure the output is sorted by keys and contains no duplicate
+    // key-value pairs
+    for (uint32_t i = 1; i < output.size(); i++) {
+      assert(key_comparator_(output[i - 1].first, output[i].first) ||
+             output[i - 1].second != output[i].second);
+    }
+#endif
+
+    return std::make_pair(left_sibling, right_sibling);
+  }
+
+  /*
+  std::pair<pid_t, pid_t> CollapseInnerNodeData(
+      Node* node, std::vector<std::pair<KeyType, pid_t>>& output) const {
+    assert(node != nullptr);
+    assert(!IsLeaf(node));
     uint32_t chain_length = 0;
 
     std::vector<std::pair<KeyType, pid_t>> inserted;
@@ -1320,6 +1416,7 @@ class BWTree {
     pid_t right_sibling = kInvalidPid;
     KeyType* stop_key = nullptr;
     Node* curr = node;
+    // Process delta chain backwards
     while (curr->node_type != Node::NodeType::Leaf) {
       switch (curr->node_type) {
         case Node::NodeType::DeltaIndex: {
@@ -1445,6 +1542,7 @@ class BWTree {
 #endif
     return std::make_pair(left_sibling, right_sibling);
   }
+  */
 
   std::pair<pid_t, pid_t> CollapseLeafData(
       Node* node, std::vector<std::pair<KeyType, ValueType>>& output) const {
@@ -1472,6 +1570,7 @@ class BWTree {
     uint32_t deleted = 0;
     uint32_t inserted = 0;
     uint32_t chain_length = 0;
+    // Process delta chain backwards
     while (!chain.empty()) {
       DeltaNode* delta = static_cast<DeltaNode*>(chain.top());
       chain.pop();

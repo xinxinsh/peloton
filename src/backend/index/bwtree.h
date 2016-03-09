@@ -13,9 +13,10 @@
 #pragma once
 
 #include "backend/common/logger.h"
-#include "backend/index/epoch_manager.h"
+//#include "backend/index/epoch_manager.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -23,14 +24,294 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stack>
 #include <set>
+#include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 namespace peloton {
 namespace index {
 
+//===--------------------------------------------------------------------===//
+// The epoch manager tracks epochs in the system and arranges for memory
+// reclamation at safe points. There is no global GC thread, but rather each
+// thread performs GC on data items it has deleted.
+//
+// There is a global epoch timer that is updated at kEpochTimer (ms) intervals
+// by a dedicated epoch ticker thread.  In addition to moving the epoch, this
+// thread also discovers the lowest active epoch amongst all threads that have
+// registered with this manager.
+//
+// Every thread has state (ThreadState) that tracks the current epoch it is in.
+// Most importantly, this state also tracks all items that have been marked
+// deleted by the thread.  This information is stored in a linked list of
+// DeletionGroups. A deletion group just represents a collection of items that
+// have been marked as garbage in the same epoch.  Because epochs increase
+// monotonically, it can be guaranteed that the head of the deletion list
+// has a lower epoch that those groups towards the tail of the list.
+//
+// When a thread exits an epoch, it uses the lowest epoch variable that is
+// updated by the ticker thread to determine the items that can be safely
+// freed. A thread only ever frees deleted items it marked itself.
+//===--------------------------------------------------------------------===//
+template <class Freeable>
+class EpochManager {
+ private:
+  // The type of the epoch
+  typedef uint64_t epoch_t;
+  // The frequency the global epoch is updated
+  static const uint64_t kEpochTimer = 40;
+
+  // Represents a group of items belonging to the same epoch that can be
+  // deleted together
+  static const uint32_t kGroupSize = 32;
+  struct DeletionGroup {
+    std::array<Freeable, kGroupSize> items;
+    epoch_t epoch;
+    uint32_t num_items = 0;
+    DeletionGroup* next_group = nullptr;
+  };
+
+  struct DeletionList {
+    DeletionGroup* head = nullptr;
+    DeletionGroup* tail = nullptr;
+    DeletionGroup* free_to_use_groups = nullptr;
+
+    ~DeletionList() {
+      LOG_DEBUG("Freeing all memory in all deletion groups during shutdown");
+
+      // Free all the stuff that was marked deleted, but was potentially in use
+      // by another thread.  We can do this because we're shutting down.
+      Free(std::numeric_limits<epoch_t>::max());
+
+      // Reclaim memory we created for deletion groups
+      while (head != nullptr) {
+        DeletionGroup* tmp = head;
+        head = head->next_group;
+        delete tmp;
+      }
+      while (free_to_use_groups != nullptr) {
+        DeletionGroup* tmp = free_to_use_groups;
+        free_to_use_groups = free_to_use_groups->next_group;
+        delete tmp;
+      }
+    }
+
+    // Get a deletion group with sufficient space for items deleted in
+    // the given eopch
+    // TODO: Does it really have to be the same epoch?
+    DeletionGroup* GetAvailableGroup(epoch_t epoch) {
+      if (tail != nullptr && tail->epoch == epoch &&
+          tail->num_items < kGroupSize - 1) {
+        return tail;
+      }
+
+      // Either the tail is null, or has a different epoch or has no room
+      // for new entries.  In any case, we need a new fresh group
+
+      DeletionGroup* group = nullptr;
+      if (free_to_use_groups != nullptr) {
+        group = free_to_use_groups;
+        free_to_use_groups = free_to_use_groups->next_group;
+      } else {
+        group = new DeletionGroup();
+      }
+      group->epoch = epoch;
+      group->num_items = 0;
+      group->next_group = nullptr;
+
+      if (head == nullptr) {
+        assert(tail == nullptr);
+        head = tail = group;
+      } else {
+        assert(tail != nullptr);
+        tail->next_group = group;
+        tail = group;
+      }
+      return group;
+    }
+
+    // Mark the given freeable item as deleted in the provided epoch
+    void MarkDeleted(Freeable freeable, epoch_t epoch) {
+      DeletionGroup* to_add = GetAvailableGroup(epoch);
+      assert(to_add != nullptr);
+      assert(to_add->epoch == epoch);
+      assert(to_add->num_items < kGroupSize);
+      to_add->items[to_add->num_items++] = freeable;
+    }
+
+    // Free all deleted data before the given epoch
+    void Free(epoch_t epoch) {
+      uint32_t freed = 0;
+      while (head != nullptr && head->epoch < epoch) {
+        DeletionGroup* next = head->next_group;
+        // All items in the head deletion group can be freed
+        for (uint32_t i = 0; i < head->num_items; i++, freed++) {
+          head->items[i].Free();
+        }
+        // Add the deletion group to the free_to_use list
+        head->next_group = free_to_use_groups;
+        free_to_use_groups = head;
+        head = next;
+      }
+      if (freed > 0) {
+        LOG_DEBUG("Freed %u objects before epoch %lu", freed, epoch);
+      }
+    }
+  };
+
+  // Captures the state information for every thread that participates in
+  // epoch-based garbage collection.
+  // Note: None of these members need to be protected through a mutex
+  //       because we guarantee that all mutations are performed by
+  //       a single thread (the thread whose state it represents)
+  struct ThreadState {
+    bool initialized = false;
+    volatile epoch_t local_epoch = 0;
+    DeletionList deletion_list;
+    uint32_t added = 0;
+    uint32_t deleted = 0;
+  };
+
+  // Get the epoch thread state for the currently executing thread
+  ThreadState* GetThreadState() {
+    static thread_local ThreadState thread_state;
+    return &thread_state;
+  }
+
+ public:
+  // Constructor
+  EpochManager()
+      : global_epoch_(0), lowest_epoch_(0), stop_(false), epoch_mover_() {
+    /* Nothing */
+  }
+
+  // Destructor
+  ~EpochManager() {
+    stop_.store(true);
+    epoch_mover_.join();
+  }
+
+  void Init() {
+    // Start the epoch ticker thread
+    epoch_mover_ = std::thread{&EpochManager::EpochTicker, this};
+  }
+
+  void EpochTicker() {
+    LOG_DEBUG("Starting epoch ticker thread");
+    std::chrono::milliseconds sleep_duration{kEpochTimer};
+    while (!stop_.load()) {
+      // Sleep
+      std::this_thread::sleep_for(sleep_duration);
+      // Increment global epoch
+      global_epoch_++;
+      uint32_t num_states = 0;
+      {
+        // Find the lowest epoch number among active threads. Data with
+        // epoch < lowest can be deleted
+        std::lock_guard<std::mutex> lock{states_mutex_};
+        num_states = thread_states_.size();
+        epoch_t lowest = global_epoch_.load();
+        for (const auto& iter : thread_states_) {
+          ThreadState* state = iter.second;
+          if (state->local_epoch < lowest) {
+            lowest = state->local_epoch;
+          }
+        }
+        lowest_epoch_.store(lowest);
+      }
+      LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu, # states: %u",
+                global_epoch_.load(), lowest_epoch_.load(), num_states);
+      assert(lowest_epoch_.load() <= global_epoch_.load());
+    }
+    LOG_DEBUG("Shutting down epoch ticker thread");
+  }
+
+  // Called by threads that want to enter the current epoch, indicating that
+  // it will need all resources that are visible in this epoch
+  void EnterEpoch() {
+    auto* self_state = GetThreadState();
+    if (!self_state->initialized) {
+      // do init
+      self_state->initialized = true;
+      std::lock_guard<std::mutex> lock{states_mutex_};
+      thread_states_[std::this_thread::get_id()] = self_state;
+    }
+    self_state->local_epoch = GetCurrentEpoch();
+  }
+
+  // Called by a thread that wishes to mark the provided freeable entity as
+  // deleted in this epoch. The data will not be deleted immediately, but only
+  // when it it safe to do so, i.e., when all active threads have quiesced and
+  // exited the epoch.
+  //
+  // Note: The Freeable type must have a Free(...) function that can be called
+  //       to physically free the memory
+  void MarkDeleted(Freeable freeable) {
+    auto* self_state = GetThreadState();
+    assert(self_state->initialized);
+
+    // Get the deletion list for the thread and mark the ptr as deleted by
+    // this thread in the thread's local epoch
+    auto& deletion_list = self_state->deletion_list;
+    deletion_list.MarkDeleted(freeable, self_state->local_epoch);
+  }
+
+  // The thread wants to exit the epoch, indicating it no longer needs
+  // protected access to the data
+  void ExitEpoch() {
+    auto* self_state = GetThreadState();
+    assert(self_state->initialized);
+    auto& deletion_list = self_state->deletion_list;
+    deletion_list.Free(lowest_epoch_.load());
+  }
+
+  // Get the current epoch
+  epoch_t GetCurrentEpoch() const {
+    return global_epoch_.load();
+  }
+
+ private:
+  // The global epoch number
+  std::atomic<epoch_t> global_epoch_;
+  // The current minimum epoch that any transaction is in
+  std::atomic<epoch_t> lowest_epoch_;
+
+  // The thread that increments the epoch
+  std::atomic<bool> stop_;
+  std::thread epoch_mover_;
+
+  // The map from threads to their states, and mutex that protects it
+  std::mutex states_mutex_;
+  std::unordered_map<std::thread::id, ThreadState*> thread_states_;
+};
+
+//===--------------------------------------------------------------------===//
+// A handy scoped guard that callers can use at the beginning of pieces of
+// code they need to execute within an epoch(s)
+//===--------------------------------------------------------------------===//
+template <class Type>
+class EpochGuard {
+ public:
+  // Constructor (enters the current epoch)
+  EpochGuard(EpochManager<Type>& em): em_(em) {
+    em_.EnterEpoch();
+  }
+  // Desctructor (exits the epoch)
+  ~EpochGuard() {
+    em_.ExitEpoch();
+  }
+ private:
+  // The epoch manager
+  EpochManager<Type>& em_;
+};
+
+//===--------------------------------------------------------------------===//
+// The mapping table.  Right now it's fixed size.
+//===--------------------------------------------------------------------===//
 template <typename KeyType, typename ValueType, typename Hasher>
 class MappingTable {
  public:
@@ -610,12 +891,12 @@ class BWTree {
         pid_t node_pid_ = tree_.RightSibling(node_);
         if (node_pid_ == kInvalidPid) {
           // No more data
-          LOG_DEBUG("At right-most leaf, no more data");
+          //LOG_DEBUG("At right-most leaf, no more data");
           curr_idx_ = 0;
           node_ = nullptr;
           collapsed_contents_.clear();
         } else {
-          LOG_DEBUG("Moving right to next tree node [%lu]", node_pid_);
+          //LOG_DEBUG("Moving right to next tree node [%lu]", node_pid_);
           curr_idx_ = 0;
           node_ = tree_.GetNode(node_pid_);
           collapsed_contents_.clear();
@@ -643,6 +924,10 @@ class BWTree {
 
     // Access to the value the iterator points to
     ValueType data() const { return collapsed_contents_[curr_idx_].second; }
+
+    pid_t node() const { return node_pid_; }
+
+    uint32_t index() const { return curr_idx_; }
 
    private:
     const BWTree<KeyType, ValueType, KeyComparator, ValueComparator,
@@ -744,6 +1029,7 @@ class BWTree {
   void InstallIndexDelta(pid_t split_node_pid, pid_t right_pid,
                          KeyType low_key, KeyType high_key,
                          std::vector<std::pair<pid_t, KeyType>>& traversal) {
+    assert(KeyLessEqual(low_key, high_key));
     // Find the correct parent of the split_node_pid node
     pid_t parent_pid = kInvalidPid;
 
@@ -820,6 +1106,9 @@ class BWTree {
             "Successfully CASed delta index entry into [%lu]. "
             "Previous was (%p), new is (%p)",
             parent_pid, parent, index);
+        std::vector<std::pair<KeyType, pid_t>> o;
+        CollapseInnerNodeData(index, o);
+        LOG_DEBUG("Visibility of new index check");
         return;
       }
 
@@ -1056,6 +1345,23 @@ class BWTree {
         delete delta_insert;
       }
     }
+#ifndef NDEBUG
+    bool first = true;
+    KeyType last;
+    for (auto iter = begin(), e = end(); iter != e; ++iter) {
+      if (!first) {
+        if (!KeyLessEqual(last, iter.key())){
+          pid_t n = iter.node();
+          Node* node = GetNode(n);
+          LOG_DEBUG("Keys in %s [%lu] not sorted at %u", IsLeaf(node) ? "leaf" : "inner-node", n, iter.index());
+          assert(false);
+        }
+        //assert(KeyLessEqual(last, iter.key()));
+      }
+      last = iter.key();
+      first = false;
+    }
+#endif
     return true;
   }
 
@@ -1266,6 +1572,7 @@ class BWTree {
           // If delta.low_key < key <= delta.high_key, then we follow the path
           // to the child this index entry points to
           const auto* index = static_cast<const DeltaIndex*>(curr_node);
+          LOG_DEBUG("Checking delta index");
           if (KeyLess(index->low_key, key) &&
               (index->rightmost || KeyLessEqual(key, index->high_key))) {
             FindInnerNodeResult result;
@@ -1439,6 +1746,20 @@ class BWTree {
     uint32_t chain_length = 0;
     // Process delta chain backwards
     while (!chain.empty()) {
+#ifndef NDEBUG
+        std::string out;
+        bool first = true;
+        for (uint32_t i = 0; i < output.size() - 1; i++) {
+          if (!first) out.append(", ");
+          first = false;
+          out.append(std::to_string(output[i].second));
+          out.append(", K");
+        }
+        out.append(", ");
+        out.append(std::to_string(output.back().second));
+        LOG_DEBUG("Step %lu: %s", chain.size(), out.c_str());
+#endif
+
       DeltaNode* delta = static_cast<DeltaNode*>(chain.top());
       chain.pop();
       chain_length++;
@@ -1447,7 +1768,7 @@ class BWTree {
           DeltaIndex* index = static_cast<DeltaIndex*>(delta);
           std::pair<KeyType, pid_t> kv{index->low_key, index->new_child_pid};
           auto pos = std::lower_bound(output.begin(), --output.end(), kv, cmp);
-          if (pos == output.end()) {
+          if (pos == --output.end()) {
             output.back().first = index->low_key;
             output.emplace_back(KeyType(), index->new_child_pid);
           } else {
@@ -1482,6 +1803,20 @@ class BWTree {
         }
       }
     }
+
+#ifndef NDEBUG
+        std::string out;
+        bool first = true;
+        for (uint32_t i = 0; i < output.size() - 1; i++) {
+          if (!first) out.append(", ");
+          first = false;
+          out.append(std::to_string(output[i].second));
+          out.append(", K");
+        }
+        out.append(", ");
+        out.append(std::to_string(output.back().second));
+        LOG_DEBUG("Step 0: %s", out.c_str());
+#endif
 
     LOG_DEBUG(
         "CollapseInnerData: Found %u inserted, %u deleted, chain length %u, "
@@ -1724,10 +2059,12 @@ class BWTree {
         }
       }
     }
+    if (0) {
     LOG_DEBUG(
         "CollapseLeafData: Found %u inserted, %u deleted, chain length %u, "
         "base page size %u, size after insertions/deletions/splits/merges %lu",
         inserted, deleted, chain_length, base_size, output.size());
+    }
     assert(std::is_sorted(output.begin(), output.end(), cmp));
 #ifndef NDEBUG
     // Make sure the output is sorted by keys and contains no duplicate
@@ -1940,6 +2277,21 @@ class BWTree {
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
         LOG_DEBUG("Inner-node [%lu] consolidation successful, marking for deletion",
                   node_pid);
+
+#ifndef
+        std::string out;
+        bool first = true;
+        for (uint32_t i = 0; i < consolidated->num_entries; i++) {
+          if (!first) out.append(", ");
+          first = false;
+          out.append(std::to_string(consolidated->children[i]));
+          if (i < consolidated->num_entries - 1) out.append(", K");
+        }
+        out.append(", ");
+        out.append(std::to_string(consolidated->children[consolidated->num_entries]));
+        LOG_DEBUG("Node after consolidation: %s", out.c_str());
+#endif
+
         return;
       }
 

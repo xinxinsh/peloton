@@ -302,33 +302,16 @@ void InsertTest(index::Index *index, VarlenPool *pool, size_t scale_factor){
 }
 
 // INSERT HELPER FUNCTION
-void InsertUniqueTest(index::Index *index, VarlenPool *pool, size_t scale_factor){
+void InsertUniqueTest(index::Index *index, VarlenPool *pool, size_t num_keys) {
   // Loop based on scale factor
-  for(size_t scale_itr = 1; scale_itr <= scale_factor; scale_itr++) {
+  for(uint32_t i = 0; i < num_keys; i++) {
     // Insert a bunch of keys based on scale itr
-    std::unique_ptr<storage::Tuple> key0(new storage::Tuple(key_schema, true));
-    std::unique_ptr<storage::Tuple> key1(new storage::Tuple(key_schema, true));
-    std::unique_ptr<storage::Tuple> key2(new storage::Tuple(key_schema, true));
-    std::unique_ptr<storage::Tuple> key3(new storage::Tuple(key_schema, true));
-    std::unique_ptr<storage::Tuple> key4(new storage::Tuple(key_schema, true));
-
-    key0->SetValue(0, ValueFactory::GetIntegerValue(1 * (int32_t)std::pow(10, scale_itr)), pool);
-    key0->SetValue(1, ValueFactory::GetStringValue("a"), pool);
-    key1->SetValue(0, ValueFactory::GetIntegerValue(2 * (int32_t)std::pow(10, scale_itr)), pool);
-    key1->SetValue(1, ValueFactory::GetStringValue("b"), pool);
-    key2->SetValue(0, ValueFactory::GetIntegerValue(3 * (int32_t)std::pow(10, scale_itr)), pool);
-    key2->SetValue(1, ValueFactory::GetStringValue("c"), pool);
-    key3->SetValue(0, ValueFactory::GetIntegerValue(4 * (int32_t)std::pow(10, scale_itr)), pool);
-    key3->SetValue(1, ValueFactory::GetStringValue("d"), pool);
-    key4->SetValue(0, ValueFactory::GetIntegerValue(5 * (int32_t)std::pow(10, scale_itr)), pool);
-    key4->SetValue(1, ValueFactory::GetStringValue("e"), pool);
+    std::unique_ptr<storage::Tuple> key(new storage::Tuple(key_schema, true));
+    key->SetValue(0, ValueFactory::GetIntegerValue(i), pool);
+    key->SetValue(1, ValueFactory::GetStringValue("a"), pool);
 
     // INSERT
-    index->InsertEntry(key0.get(), item0);
-    index->InsertEntry(key1.get(), item0);
-    index->InsertEntry(key2.get(), item1);
-    index->InsertEntry(key3.get(), item1);
-    index->InsertEntry(key4.get(), item1);
+    index->InsertEntry(key.get(), item0);
   }
 }
 
@@ -393,11 +376,11 @@ TEST(IndexTests, InnerNodeSplitTest) {
   std::unique_ptr<index::Index> index(BuildIndex());
 
   uint32_t num_threads = 1;
-  size_t scale_factor = 20;
-  LaunchParallelTest(num_threads, InsertUniqueTest, index.get(), pool, scale_factor);
+  size_t num_keys = 100;
+  LaunchParallelTest(num_threads, InsertUniqueTest, index.get(), pool, num_keys);
 
   locations = index->ScanAllKeys();
-  EXPECT_EQ(locations.size(), scale_factor * 5 * num_threads);
+  EXPECT_EQ(locations.size(), num_keys * num_threads);
 }
 
 TEST(IndexTests, DuplicateKeyTest) {
@@ -443,11 +426,11 @@ TEST(IndexTests, IncreasingKeysTest) {
   std::unique_ptr<index::Index> index(BuildIndex());
 
   uint32_t num_threads = 1;
-  size_t scale_factor = 6;
-  LaunchParallelTest(num_threads, InsertUniqueTest, index.get(), pool, scale_factor);
+  size_t num_keys = 40;
+  LaunchParallelTest(num_threads, InsertUniqueTest, index.get(), pool, num_keys);
 
   locations = index->ScanAllKeys();
-  EXPECT_EQ(locations.size(), scale_factor * 5 * num_threads);
+  EXPECT_EQ(locations.size(), num_keys);
 }
 
 TEST(IndexTests, DeleteTest) {

@@ -685,18 +685,6 @@ class BWTree {
     epoch_manager_.Init();
   }
 
-  pid_t GetLeft(Node* node) const {
-    Node* curr = node;
-    while (curr->node_type != Node::NodeType::Inner &&
-           curr->node_type != Node::NodeType::Leaf) {
-      DeltaNode* delta = static_cast<DeltaNode*>(curr);
-      curr = delta->next;
-    }
-    pid_t left_link_pid = static_cast<DataNode*>(curr)->left_link;
-    assert(left_link_pid != kInvalidPid);
-    return left_link_pid;
-  }
-
   pid_t FindOnLevel(pid_t node_pid, KeyType key) {
     pid_t curr_pid = node_pid;
     Node* curr = GetNode(curr_pid);
@@ -742,7 +730,7 @@ class BWTree {
         }
         case Node::NodeType::DeltaRemoveInner: {
           // Go to left child
-          curr_pid = GetLeft(curr);
+          curr_pid = LeftSibling(curr);
           curr = GetNode(curr_pid);
         }
         default: {
@@ -786,6 +774,7 @@ class BWTree {
       // CAS in
       if (root_pid_.compare_exchange_strong(split_node_pid, new_root_pid)) {
         // Successfully CASed in a new root
+        AddAllocatedBytes(new_root);
         LOG_DEBUG(
             "New root [%lu] created with left child [%lu] and right "
             "child [%lu] (i.e., num_entries = %u)",
@@ -799,7 +788,6 @@ class BWTree {
 
       parent_pid = root_pid_.load();
     }
-
 
     while (true) {
       LOG_DEBUG("Parent of [%lu] is [%lu]. We'll install the delta on it.",
@@ -827,6 +815,7 @@ class BWTree {
       index->rightmost = right_pid == rightmost_leaf_pid_.load();
       if (mapping_table_.Cas(parent_pid, parent, index)) {
         // Successful Cas
+        AddAllocatedBytes(index);
         LOG_DEBUG(
             "Successfully CASed delta index entry into [%lu]. "
             "Previous was (%p), new is (%p)",
@@ -835,12 +824,10 @@ class BWTree {
       }
 
       // Failed CAS, retry
-      LOG_DEBUG("CAS failed to install delta index into [%lu], retrying",
-                parent_pid);
+      LOG_DEBUG("Delta index installation on [%lu] (%p) failed, retrying",
+                parent_pid, parent);
       delete index;
 
-      LOG_DEBUG("Finding correct parent of [%lu] (old one was [%lu])",
-                split_node_pid, parent_pid);
       parent_pid = FindOnLevel(parent_pid, low_key);
     }
     // Nothing
@@ -934,6 +921,17 @@ class BWTree {
         new_right = new_inner;
       }
 
+      if (traversal.size() > 1) {
+        // The node has a parent in the traversal, take the key we used to get down here
+        for (uint32_t i = 1; i < traversal.size(); i++) {
+          if (traversal[i].first == node_pid) {
+            LOG_DEBUG("High-key of split taken from traversal");
+            high_key = traversal[i - 1].second;
+            break;
+          }
+        }
+      }
+
       // Step 2: Insert node holding right-half of split into mapping table
       new_right_pid = NextPid();
       bool inserted = mapping_table_.Insert(new_right_pid, new_right);
@@ -958,6 +956,8 @@ class BWTree {
 
       if (mapping_table_.Cas(node_pid, node, split)) {
         // Success, proceed to the next step
+        AddAllocatedBytes(new_right);
+        AddAllocatedBytes(split);
         LOG_DEBUG("Successful CAS of split-delta onto node [%lu] (%p)",
                   node_pid, GetNode(node_pid));
         we_did_split = true;
@@ -1036,6 +1036,7 @@ class BWTree {
           DeltaInsert::Create(key, value, leaf, num_entries + 1);
       if (mapping_table_.Cas(result.node_pid, leaf, delta_insert)) {
         // SUCCESS
+        AddAllocatedBytes(delta_insert);
         LOG_DEBUG("Installed delta insert into node [%lu]", result.node_pid);
         if (num_entries > insert_branch_factor) {
           // Split the leaf we inserted into
@@ -1935,11 +1936,15 @@ class BWTree {
 
       // CAS
       if (mapping_table_.Cas(node_pid, node, consolidated)) {
+        AddAllocatedBytes(consolidated);
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
         LOG_DEBUG("Inner-node [%lu] consolidation successful, marking for deletion",
                   node_pid);
         return;
       }
+
+      LOG_DEBUG("Inner %lu (%p) consolidation failed, retrying ", node_pid, node);
+      delete consolidated;
     }
   }
 
@@ -1972,7 +1977,7 @@ class BWTree {
 
       if (mapping_table_.Cas(node_pid, node, consolidated)) {
         // Mark the node as deleted
-        assert(node != nullptr);
+        AddAllocatedBytes(consolidated);
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
         LOG_DEBUG("Leaf %lu (%p) successfully consolidated to (%p)", node_pid,
                   node, consolidated);
@@ -1980,6 +1985,7 @@ class BWTree {
       }
 
       LOG_DEBUG("Leaf %lu (%p) consolidation failed, retrying ", node_pid, node);
+      delete consolidated;
     }
   }
 
@@ -2014,6 +2020,19 @@ class BWTree {
   bool IsDeleted(const Node* node) const {
     return node->node_type == Node::NodeType::DeltaRemoveLeaf ||
            node->node_type == Node::NodeType::DeltaRemoveInner;
+  }
+
+  pid_t LeftSibling(const Node* node) const {
+    assert(node != nullptr);
+    const Node* curr = node;
+    while (curr->node_type != Node::NodeType::Inner &&
+           curr->node_type != Node::NodeType::Leaf) {
+      const auto * delta = static_cast<const DeltaNode*>(curr);
+      curr = delta->next;
+    }
+    pid_t left_link_pid = static_cast<const DataNode*>(curr)->left_link;
+    assert(left_link_pid != kInvalidPid);
+    return left_link_pid;
   }
 
   pid_t RightSibling(const Node* node) const {
@@ -2063,6 +2082,63 @@ class BWTree {
     }
   }
 
+  // The size of the immediate physical node
+  uint32_t NodeSizeInBytes(const Node* node) const {
+    assert(node != nullptr);
+    switch (node->node_type) {
+      case Node::NodeType::Inner: {
+        const auto* inner = static_cast<const InnerNode*>(node);
+        uint32_t size = sizeof(DataNode);
+        size += inner->num_entries * (sizeof(KeyType) + sizeof(pid_t));
+        size += sizeof(pid_t);
+        return size;
+      }
+      case Node::NodeType::Leaf: {
+        const auto* leaf = static_cast<const LeafNode*>(node);
+        uint32_t size = sizeof(DataNode);
+        size += leaf->num_entries * (sizeof(KeyType) + sizeof(ValueType));
+        return size;
+      }
+      case Node::NodeType::DeltaInsert: {
+        return sizeof(DeltaInsert);
+      }
+      case Node::NodeType::DeltaDelete: {
+        return sizeof(DeltaDelete);
+      }
+      case Node::NodeType::DeltaMerge:
+      case Node::NodeType::DeltaMergeInner: {
+        return sizeof(DeltaMerge);
+      }
+      case Node::NodeType::DeltaSplit:
+      case Node::NodeType::DeltaSplitInner: {
+        return sizeof(DeltaSplit);
+      }
+      case Node::NodeType::DeltaIndex: {
+        return sizeof(DeltaIndex);
+      }
+      case Node::NodeType::DeltaDeleteIndex: {
+        return sizeof(DeltaDeleteIndex);
+      }
+      case Node::NodeType::DeltaRemoveLeaf:
+      case Node::NodeType::DeltaRemoveInner: {
+        return sizeof(DeltaNode);
+      }
+      default: {
+        LOG_DEBUG("Node (%p) has unknown type %s during size computation",
+                  node, std::to_string(node->node_type).c_str());
+        assert(false);
+      }
+    }
+  }
+
+  uint64_t AddAllocatedBytes(const Node* node) {
+    return size_in_bytes_ += NodeSizeInBytes(node);
+  }
+
+  uint64_t MarkReclaimedBytes(const Node* node) {
+    return size_in_bytes_ -= NodeSizeInBytes(node);
+  }
+
   // Delete the memory for this node's delta chain and base node
   void FreeNode(Node* node) {
     LOG_DEBUG("Freeing node (%p)", node);
@@ -2079,17 +2155,23 @@ class BWTree {
 
       // Delete the delta's memory
       DeltaNode* delta = static_cast<DeltaNode*>(curr);
+      MarkReclaimedBytes(delta);
+      size_in_bytes_ -= NodeSizeInBytes(delta);
       curr = delta->next;
       delete delta;
       chain_length++;
     }
     auto node_type = curr->node_type;
-
-    // Delete the base node
+    MarkReclaimedBytes(curr);
     delete curr;
 
     LOG_DEBUG("Freed node (%p) type %d with chain length of %u", node,
               node_type, chain_length);
+  }
+
+  // We do co-operative epoch-based GC
+  void Cleanup() {
+    // Nothing
   }
 
   // Return the next free/available PID

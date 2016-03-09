@@ -340,7 +340,7 @@ TEST(IndexTests, DeleteTest) {
   delete tuple_schema;
 }
 
-/*TEST(IndexTests, MultiThreadedInsertTest) {
+TEST(IndexTests, MultiThreadedInsertTest) {
   auto pool = TestingHarness::GetInstance().GetTestingPool();
   std::vector<ItemPointer> locations;
 
@@ -348,7 +348,7 @@ TEST(IndexTests, DeleteTest) {
   std::unique_ptr<index::Index> index(BuildIndex());
 
   // Parallel Test
-  size_t num_threads = 4;
+  size_t num_threads = 1;
   size_t scale_factor = 1;
   LaunchParallelTest(num_threads, InsertTest, index.get(), pool, scale_factor);
 
@@ -372,7 +372,7 @@ TEST(IndexTests, DeleteTest) {
   EXPECT_EQ(locations[0].block, item0.block);
 
   delete tuple_schema;
-}*/
+}
 
 }  // End test namespace
 }  // End peloton namespace

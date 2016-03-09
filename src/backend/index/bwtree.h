@@ -309,6 +309,32 @@ class BWTree {
     KeyType merge_key;
     pid_t old_right_pid;
     Node* old_right;
+
+    static DeltaMerge* CreateInner(KeyType merge_key, pid_t old_right_pid,
+                                   Node *old_right, uint32_t num_entries,
+                                   Node* next) {
+      DeltaMerge* merge = new DeltaMerge();
+      merge->node_type = Node::NodeType::DeltaMergeInner;
+      merge->merge_key = merge_key;
+      merge->old_right_pid = old_right_pid;
+      merge->old_right = old_right;
+      merge->num_entries = num_entries;
+      merge->next = next;
+      return merge;
+    }
+
+    static DeltaMerge* CreateLeaf(KeyType merge_key, pid_t old_right_pid,
+                                  Node *old_right, uint32_t num_entries,
+                                  Node* next) {
+      DeltaMerge* merge = new DeltaMerge();
+      merge->node_type = Node::NodeType::DeltaMerge;
+      merge->merge_key = merge_key;
+      merge->old_right_pid = old_right_pid;
+      merge->old_right = old_right;
+      merge->num_entries = num_entries;
+      merge->next = next;
+      return merge;
+    }
   };
 
   //===--------------------------------------------------------------------===//
@@ -407,6 +433,20 @@ class BWTree {
     pid_t owner;
     KeyType deleted_key;
     pid_t deleted_pid;
+
+    static DeltaIndex* Create(KeyType low_key, KeyType high_key,
+        pid_t owner, KeyType deleted_key, pid_t deleted_pid,
+        uint32_t num_entries, Node *next) {
+      auto* index = new DeltaDeleteIndex();
+      index->low_key = low_key;
+      index->high_key = high_key;
+      index->owner = owner;
+      index->deleted_key = deleted_key;
+      index->deleted_pid = deleted_pid;
+      index->num_entries = num_entries;
+      index->next = next;
+      return index;
+    }
   };
 
   //===--------------------------------------------------------------------===//
@@ -964,6 +1004,237 @@ class BWTree {
       }
     }
     return true;
+  }
+
+  void InstallIndexDeltaDelete(const pid_t left_pid, const pid_t right_pid,
+                               const KeyType merge_key, const KeyType low_key,
+                               const KeyType high_key,
+                               std::vector<std::pair<pid_t, KeyType>>&
+                                 traversal) {
+    while (true) {
+      // Find the correct parent of the left_pid node
+      pid_t parent_pid = kInvalidPid;
+
+      if (!traversal.empty()) {
+        bool found_left = false;
+        for (uint32_t i = traversal.size() - 1; i >= 0; i--) {
+          if (found_left) {
+            if (!IsDeleted(GetNode(traversal[i].first))) {
+              parent_pid = traversal[i].first;
+              break;
+            }
+          } else if (traversal[i].first == left_pid) {
+            found_left = true;
+          }
+        }
+      }
+
+      // If parent == nullptr, when we're creating a new root
+      if (parent_pid == kInvalidPid) {
+        LOG_DEBUG("Node [%lu] is the root, we'll be creating a new root!",
+                  left_pid);
+        auto* new_root =
+            InnerNode::Create(low_key, high_key, kInvalidPid, kInvalidPid, 1);
+        new_root->keys[0] = low_key;
+        new_root->children[0] = left_pid;
+        new_root->children[1] = right_pid;
+
+        // Insert new root into mapping table
+        pid_t new_root_pid = NextPid();
+        assert(mapping_table_.Insert(new_root_pid, new_root));
+
+        // CAS in
+        pid_t old_root_pid = root_pid_.load();
+        if (root_pid_.compare_exchange_strong(old_root_pid, new_root_pid)) {
+          // Successfully CASed in a new root
+          LOG_DEBUG(
+              "New root [%lu] created with left child [%lu] and right "
+              "child [%lu]",
+              new_root_pid, left_pid, right_pid);
+          break;
+        }
+
+        // CAS failed, try again
+        mapping_table_.Remove(new_root_pid);
+        delete new_root;
+
+      } else {
+        LOG_DEBUG("Parent of node %lu is %lu. We'll install the delta on it.",
+                  left_pid, parent_pid);
+
+        // Before inserting the delta, check if some other thread snuck in and
+        // inserted the delta index node we intended to
+        Node* parent = GetNode(parent_pid);
+        assert(!IsLeaf(parent));
+        std::vector<std::pair<KeyType, pid_t>> entries;
+        CollapseInnerNodeData(parent, entries);
+
+        for (uint32_t i = 0; i < entries.size(); i++) {
+          if (KeyEqual(low_key, entries[i].first) &&
+              left_pid == entries[i].second) {
+            // Someone inserted the delta index term already, we don't have to
+            return;
+          }
+        }
+
+        // Try to insert
+        auto* index = DeltaDeleteIndex::Create(
+            low_key, high_key, left_pid,
+            merge_key, right_pid,
+            NodeSize(parent) + 1, parent);
+        if (mapping_table_.Cas(parent_pid, parent, index)) {
+          // Successful Cas
+          break;
+        }
+
+        // Failed CAS, retry
+        delete index;
+      }
+    }
+    // Nothing
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Merge the node whose PID is node_pid. It is entirely possible that the
+  // node we'd like to merge has already been merged by another thread. We
+  // therefore perform the conditional check to determine merge-candidacy
+  // before performing the split in a while(true) loop.
+  //===--------------------------------------------------------------------===//
+  void MergeNode(const pid_t node_pid,
+                 std::vector<std::pair<pid_t, KeyType>>& traversal) {
+    LOG_DEBUG("MergeNode: Start [%lu] ...", node_pid);
+
+    KeyType merge_key;
+    KeyType low_key;
+    KeyType high_key;
+    pid_t left_sibling_pid = kInvalidPid;
+    bool we_did_merge = false;
+
+    // Step 1: Mark the node to be merged as deleted
+    while (true) {
+      // Check if all this is necessary
+      Node* node = GetNode(node_pid);
+      bool is_leaf = IsLeaf(node);
+      // If the node has been deleted (for some reason, due to another merge),
+      // we don't do anything
+      if (IsDeleted(node)) {
+        return;
+      }
+      DeltaNode *mark_for_delete = new DeltaNode();
+      mark_for_delete->next = node;
+
+      if (is_leaf) {
+        mark_for_delete->node_type = Node::NodeType::DeltaRemoveLeaf;
+      } else {
+        mark_for_delete->node_type = Node::NodeType::DeltaRemoveInner;
+      }
+      bool cas_succ = mapping_table_.Cas(node_pid, node, mark_for_delete);
+      if (cas_succ) {
+        // Failed. Retry
+         break;
+      }
+      delete mark_for_delete;
+    }
+
+    pid_t left_node_pid = kInvalidPid;
+    Node *left_node = nullptr;
+
+    while (true) {
+      Node* node = GetNode(node_pid);
+      bool is_leaf = IsLeaf(node);
+
+      if (IsDeleted(node))
+        return;
+
+      bool leftmost = false;
+      DeltaMerge* merge = nullptr;
+
+      if (is_leaf) {
+        // Leaf
+        left_node_pid = GetLeaf(node)->left_link;
+        if (left_node_pid == kInvalidPid) {
+          left_node_pid = getLeaf(node)->right_link;
+          leftmost = true;
+        }
+        left_node = GetNode(left_node_pid);
+
+        std::vector<std::pair<KeyType, ValueType>> entries;
+        std::pair<pid_t, pid_t> links;
+        std::vector<std::pair<KeyType, ValueType>> left_entries;
+        std::pair<pid_t, pid_t> left_links;
+        if (leftmost) {
+          links = CollapseLeafData(left_node, left_entries);
+          left_links = CollapseLeafData(node, entries);
+        } else {
+         links = CollapseLeafData(node, entries);
+         left_links = CollapseLeafData(left_node, left_entries);
+        }
+
+        uint32_t num_entries = entries.size() + left_entries.size();
+        merge_key = std::get<0>(left_entries.front());
+        low_key = std::get<0>(entries.front());
+        high_key = std::get<0>(left_entries.back());
+        merge = DeltaMerge::CreateLeaf(merge_key, node_pid, node,
+                                       num_entries, left_node);
+      } else {
+        left_node_pid = GetInner(node)->left_link;
+        if (left_node_pid == kInvalidPid) {
+          left_node_pid = getLeaf(node)->right_link;
+          leftmost = true;
+        }
+        left_node = GetNode(left_node_pid);
+
+        std::vector<std::pair<KeyType, pid_t>> entries;
+        std::pair<pid_t, pid_t> links;
+        std::vector<std::pair<KeyType, pid_t>> left_entries;
+        std::pair<pid_t, pid_t> left_links;
+        if (leftmost) {
+          links = CollapseInnerData(left_node, left_entries);
+          left_links = CollapseInnderData(node, entries);
+        } else {
+         links = CollapseInnderData(node, entries);
+         left_links = CollapseInnderData(left_node, left_entries);
+        }
+
+        uint32_t num_entries = entries.size() + left_entries.size();
+        merge_key = std::get<0>(left_entries.front());
+        low_key = std::get<0>(entries.front());
+        high_key = std::get<0>(left_entries.back());
+        merge = DeltaMerge::CreateInner(merge_key, node_pid, node,
+                                       num_entries, left_node);
+      }
+
+      // Create merge delta node and try to CAS it into the left-node
+      LOG_DEBUG("Attempting to CAS merge-delta [%lu]", node_pid);
+      if (mapping_table_.Cas(left_node_pid, left_node, merge)) {
+        // Success, proceed to the next step
+        LOG_DEBUG("Successful CAS of split-delta onto node [%lu] (%p)",
+                  node_pid, GetNode(node_pid));
+        we_did_merge = true;
+        break;
+      }
+
+      // Failed, cleanup and try again
+      LOG_DEBUG("Failed CAS merge-delta onto node [%lu], retrying", node_pid);
+      delete merge;
+    }
+
+    if (we_did_merge) {
+      LOG_DEBUG(
+          "Installed merge-delta node on %lu. Attempting to insert new "
+          "merge index delta on parent ...",
+          node_pid);
+    } else {
+      LOG_DEBUG(
+          "Someone else installed merge-delta node on %lu. Attempting to "
+          "insert new split index delta on parent ...",
+          node_pid);
+    }
+
+    // TODO: change this
+    // Try to install the delta delete into the parent inner node
+    InstallIndexDeltaDelete(left_node_pid, node_pid, merge_key,
+                            low_key, high_key, traversal);
   }
 
   bool Delete(KeyType key, const ValueType value) {

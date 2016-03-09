@@ -2278,7 +2278,7 @@ class BWTree {
         LOG_DEBUG("Inner-node [%lu] consolidation successful, marking for deletion",
                   node_pid);
 
-#ifndef
+#ifndef NDEBUG
         std::string out;
         bool first = true;
         for (uint32_t i = 0; i < consolidated->num_entries; i++) {

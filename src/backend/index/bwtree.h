@@ -221,7 +221,7 @@ class BWTree {
       inner->left_link = left_link;
       inner->num_entries = num_entries;
       inner->keys = new KeyType[num_entries];
-      inner->children = new pid_t[num_entries];
+      inner->children = new pid_t[num_entries + 1];
       return inner;
     }
   };
@@ -685,95 +685,163 @@ class BWTree {
     epoch_manager_.Init();
   }
 
-  void InstallIndexDelta(const pid_t split_node_pid, const pid_t right_pid,
-                         const KeyType low_key, const KeyType high_key,
+  pid_t GetLeft(Node* node) const {
+    Node* curr = node;
+    while (curr->node_type != Node::NodeType::Inner &&
+           curr->node_type != Node::NodeType::Leaf) {
+      DeltaNode* delta = static_cast<DeltaNode*>(curr);
+      curr = delta->next;
+    }
+    pid_t left_link_pid = static_cast<DataNode*>(curr)->left_link;
+    assert(left_link_pid != kInvalidPid);
+    return left_link_pid;
+  }
+
+  pid_t FindOnLevel(pid_t node_pid, KeyType key) {
+    pid_t curr_pid = node_pid;
+    Node* curr = GetNode(curr_pid);
+    assert(!IsLeaf(curr));
+    while (curr->node_type != Node::NodeType::Inner) {
+      switch (curr->node_type) {
+        case Node::NodeType::DeltaIndex: {
+          DeltaIndex* index = static_cast<DeltaIndex*>(curr);
+          if (KeyLess(index->low_key, key) &&
+             (index->rightmost || KeyLessEqual(key, index->high_key))) {
+            return node_pid;
+          } else {
+            curr = index->next;
+          }
+          break;
+        }
+        case Node::NodeType::DeltaDeleteIndex: {
+          DeltaDeleteIndex* del = static_cast<DeltaDeleteIndex*>(curr);
+          if (KeyLess(del->low_key, key) &&
+              KeyLessEqual(key, del->high_key)) {
+            assert(!IsLeaf(GetNode(del->owner)));
+            return node_pid;
+          } else {
+            curr = del->next;
+          }
+          break;
+        }
+        case Node::NodeType::DeltaSplitInner: {
+          DeltaSplit* split = static_cast<DeltaSplit*>(curr);
+          if (KeyLessEqual(key, split->split_key)) {
+            curr = split->next;
+          } else {
+            curr_pid = split->new_right;
+            curr = GetNode(curr_pid);
+          }
+          break;
+        }
+        case Node::NodeType::DeltaMergeInner: {
+          DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
+          // TODO:
+          curr = merge->next;
+          break;
+        }
+        case Node::NodeType::DeltaRemoveInner: {
+          // Go to left child
+          curr_pid = GetLeft(curr);
+          curr = GetNode(curr_pid);
+        }
+        default: {
+          assert(false);
+        }
+      }
+    }
+    return curr_pid;
+  }
+
+  void InstallIndexDelta(pid_t split_node_pid, pid_t right_pid,
+                         KeyType low_key, KeyType high_key,
                          std::vector<std::pair<pid_t, KeyType>>& traversal) {
+    // Find the correct parent of the split_node_pid node
+    pid_t parent_pid = kInvalidPid;
+
+    if (traversal.size() > 1) {
+      for (uint32_t i = 1; i < traversal.size(); i++) {
+        if (traversal[i].first == split_node_pid) {
+          parent_pid = traversal[i - 1].first;
+          break;
+        }
+      }
+    }
+
+    // Only the root has no parent
+    if (parent_pid == kInvalidPid) {
+      LOG_DEBUG("Node [%lu] is the root, we'll be creating a new root!",
+                split_node_pid);
+      auto* new_root =
+          InnerNode::Create(low_key, high_key, kInvalidPid, kInvalidPid, 1);
+      new_root->keys[0] = low_key;
+      new_root->children[0] = split_node_pid;
+      new_root->children[1] = right_pid;
+
+      // Insert new root into mapping table
+      pid_t new_root_pid = NextPid();
+      bool inserted = mapping_table_.Insert(new_root_pid, new_root);
+      assert(inserted);
+
+      // CAS in
+      if (root_pid_.compare_exchange_strong(split_node_pid, new_root_pid)) {
+        // Successfully CASed in a new root
+        LOG_DEBUG(
+            "New root [%lu] created with left child [%lu] and right "
+            "child [%lu] (i.e., num_entries = %u)",
+            new_root_pid, split_node_pid, right_pid, new_root->num_entries);
+        return;
+      }
+
+      // CAS failed, try again
+      mapping_table_.Remove(new_root_pid);
+      delete new_root;
+
+      parent_pid = root_pid_.load();
+    }
+
+
     while (true) {
-      // Find the correct parent of the split_node_pid node
-      pid_t parent_pid = kInvalidPid;
+      LOG_DEBUG("Parent of [%lu] is [%lu]. We'll install the delta on it.",
+                split_node_pid, parent_pid);
 
-      if (!traversal.empty()) {
-        bool found_left = false;
-        for (int32_t i = traversal.size() - 1; i >= 0; i--) {
-          if (found_left) {
-            if (!IsDeleted(GetNode(traversal[i].first))) {
-              parent_pid = traversal[i].first;
-              break;
-            }
-          } else if (traversal[i].first == split_node_pid) {
-            found_left = true;
-          }
+      // Before inserting the delta, check if some other thread snuck in and
+      // inserted the delta index node we intended to
+      Node* parent = GetNode(parent_pid);
+      assert(!IsLeaf(parent));
+      std::vector<std::pair<KeyType, pid_t>> entries;
+      CollapseInnerNodeData(parent, entries);
+
+      for (uint32_t i = 0; i < entries.size(); i++) {
+        if (KeyEqual(low_key, entries[i].first) &&
+            split_node_pid == entries[i].second) {
+          // Someone inserted the delta index term already, we don't have to
+          LOG_DEBUG("Another thread inserted the delta index node. Skipping");
+          return;
         }
       }
 
-      // If parent == nullptr, when we're creating a new root
-      if (parent_pid == kInvalidPid) {
-        LOG_DEBUG("Node [%lu] is the root, we'll be creating a new root!",
-                  split_node_pid);
-        auto* new_root =
-            InnerNode::Create(low_key, high_key, kInvalidPid, kInvalidPid, 1);
-        new_root->keys[0] = low_key;
-        new_root->children[0] = split_node_pid;
-        new_root->children[1] = right_pid;
-
-        // Insert new root into mapping table
-        pid_t new_root_pid = NextPid();
-        bool inserted = mapping_table_.Insert(new_root_pid, new_root);
-        assert(inserted);
-
-        // CAS in
-        pid_t old_root_pid = root_pid_.load();
-        if (root_pid_.compare_exchange_strong(old_root_pid, new_root_pid)) {
-          // Successfully CASed in a new root
-          LOG_DEBUG(
-              "New root [%lu] created with left child [%lu] and right "
-              "child [%lu] (i.e., num_entries = %u)",
-              new_root_pid, split_node_pid, right_pid, new_root->num_entries);
-          break;
-        }
-
-        // CAS failed, try again
-        mapping_table_.Remove(new_root_pid);
-        delete new_root;
-
-      } else {
-        LOG_DEBUG("Parent of [%lu] is [%lu]. We'll install the delta on it.",
-                  split_node_pid, parent_pid);
-
-        // Before inserting the delta, check if some other thread snuck in and
-        // inserted the delta index node we intended to
-        Node* parent = GetNode(parent_pid);
-        assert(!IsLeaf(parent));
-        std::vector<std::pair<KeyType, pid_t>> entries;
-        CollapseInnerNodeData(parent, entries);
-
-        for (uint32_t i = 0; i < entries.size(); i++) {
-          if (KeyEqual(low_key, entries[i].first) &&
-              split_node_pid == entries[i].second) {
-            // Someone inserted the delta index term already, we don't have to
-            LOG_DEBUG("Another thread inserted the delta index node. Skipping");
-            return;
-          }
-        }
-
-        // Try to insert
-        auto* index = DeltaIndex::Create(low_key, high_key, right_pid,
-                                         NodeSize(parent) + 1, parent);
-        index->rightmost = right_pid == rightmost_leaf_pid_.load();
-        if (mapping_table_.Cas(parent_pid, parent, index)) {
-          // Successful Cas
-          LOG_DEBUG(
-              "Successfully CASed delta index entry into [%lu]. "
-              "Previous was (%p), new is (%p)",
-              parent_pid, parent, index);
-          break;
-        }
-
-        // Failed CAS, retry
-        LOG_DEBUG("CAS failed to install delta index into [%lu], retrying",
-                  parent_pid);
-        delete index;
+      // Try to insert
+      auto* index = DeltaIndex::Create(low_key, high_key, right_pid,
+                                       NodeSize(parent) + 1, parent);
+      index->rightmost = right_pid == rightmost_leaf_pid_.load();
+      if (mapping_table_.Cas(parent_pid, parent, index)) {
+        // Successful Cas
+        LOG_DEBUG(
+            "Successfully CASed delta index entry into [%lu]. "
+            "Previous was (%p), new is (%p)",
+            parent_pid, parent, index);
+        return;
       }
+
+      // Failed CAS, retry
+      LOG_DEBUG("CAS failed to install delta index into [%lu], retrying",
+                parent_pid);
+      delete index;
+
+      LOG_DEBUG("Finding correct parent of [%lu] (old one was [%lu])",
+                split_node_pid, parent_pid);
+      parent_pid = FindOnLevel(parent_pid, low_key);
     }
     // Nothing
   }
@@ -806,6 +874,7 @@ class BWTree {
       // to complete the second half of the split logic (delta index insertion
       // at the parent)
       if (NodeSize(node) < insert_branch_factor) {
+        /*
         Node* tmp = node;
         while (tmp->node_type != Node::NodeType::DeltaSplit &&
                tmp->node_type != Node::NodeType::DeltaSplitInner) {
@@ -819,6 +888,8 @@ class BWTree {
         high_key = split->high_key;
         new_right_pid = split->new_right;
         break;
+        */
+        return;
       }
 
       // Step 1: Create right-half of split by creating a new inner node
@@ -844,6 +915,8 @@ class BWTree {
         // Inner node
         std::vector<std::pair<KeyType, pid_t>> entries;
         std::pair<pid_t, pid_t> links = CollapseInnerNodeData(node, entries);
+        std::pair<KeyType, pid_t> right = entries.back();
+        entries.pop_back();
 
         uint32_t split_idx = entries.size() / 2;
         uint32_t num_entries = entries.size() - split_idx;
@@ -851,11 +924,11 @@ class BWTree {
         auto* new_inner =
             InnerNode::Create(entries[split_idx].first, entries.back().first,
                               node_pid, links.second, num_entries);
-        for (uint32_t i = split_idx; i < entries.size() - 1; i++) {
+        for (uint32_t i = split_idx; i < entries.size(); i++) {
           new_inner->keys[i - split_idx] = entries[i].first;
           new_inner->children[i - split_idx] = entries[i].second;
         }
-        new_inner->children[num_entries - 1] = entries.back().second;
+        new_inner->children[num_entries] = right.second;
 
         high_key = new_inner->keys[num_entries - 1];
         new_right = new_inner;
@@ -933,15 +1006,6 @@ class BWTree {
   bool Insert(KeyType key, ValueType value) {
     // Enter the epoch
     EpochGuard<NodeDeleter> guard{epoch_manager_};
-
-#if 0
-    if (first_) {
-      first_ = true;
-    } else {
-      assert(KeyLessEqual(last_, key));
-    }
-    last_ = key;
-#endif
 
     uint32_t attempt = 0;
     while (true) {
@@ -1122,7 +1186,7 @@ class BWTree {
         //       last delta (head of the chain) MUST be a DeltaRemoveNode.
         if (!IsDeleted(curr_node)) {
           // We've found the leaf
-          LOG_DEBUG("Ending at leaf [%lu] (%p)", curr, curr_node);
+          //LOG_DEBUG("Ending at leaf [%lu] (%p)", curr, curr_node);
           traversal.emplace_back(curr, KeyType());
           break;
         }
@@ -1146,7 +1210,7 @@ class BWTree {
           curr = traversal.back().first;
           traversal.pop_back();
         } else {
-          LOG_DEBUG("Going down to node [%lu] (%p)", child, GetNode(child));
+          //LOG_DEBUG("Going down to node [%lu] (%p)", child, GetNode(child));
           traversal.emplace_back(curr, search_result.high_separator);
           curr = child;
         }
@@ -1170,15 +1234,14 @@ class BWTree {
     assert(node != nullptr);
     assert(!IsLeaf(node));
 
-    uint32_t chain_length = 0;
     const Node* curr_node = node;
+    uint32_t chain_length = GetChainLength(node);
     while (curr_node->node_type != Node::NodeType::Inner) {
-      chain_length++;
+      //chain_length++;
       switch (curr_node->node_type) {
         case Node::NodeType::DeltaMergeInner: {
           const auto* merge = static_cast<const DeltaMerge*>(curr_node);
           if (KeyLessEqual(key, merge->merge_key)) {
-            // key <= merge_key, continue along the current path
             curr_node = merge->next;
           } else {
             // TODO: Complete the SMO
@@ -1189,13 +1252,11 @@ class BWTree {
         case Node::NodeType::DeltaSplitInner: {
           const auto* split = static_cast<const DeltaSplit*>(curr_node);
           if (KeyLessEqual(key, split->split_key)) {
-            // key <= split_key, continue along the current path
             curr_node = split->next;
           } else {
             // Complete the SMO
             InstallIndexDelta(node_pid, split->new_right, split->split_key,
                               split->high_key, traversal);
-            // Go to the right node since key > split_key
             curr_node = GetNode(split->new_right);
           }
           break;
@@ -1244,11 +1305,8 @@ class BWTree {
       }
     }
 
-    LOG_DEBUG("Chain length for inner-node [%lu] is %u", node_pid, chain_length);
-
     // Curr now points to the base inner node
     const auto* inner = static_cast<const InnerNode*>(curr_node);
-    LOG_DEBUG("Base inner node [%lu] size: %u", node_pid, inner->num_entries);
     auto iter = std::lower_bound(inner->keys, inner->keys + inner->num_entries,
                                  key, key_comparator_);
     uint32_t child_index = iter - inner->keys;
@@ -1366,6 +1424,7 @@ class BWTree {
     KeyPidComparator cmp{key_comparator_};
 
     // Put all inner data into the output vector
+    assert(inner->num_entries > 0);
     for (uint32_t i = 0; i < inner->num_entries; i++) {
       output.emplace_back(inner->keys[i], inner->children[i]);
     }
@@ -1386,7 +1445,7 @@ class BWTree {
         case Node::NodeType::DeltaIndex: {
           DeltaIndex* index = static_cast<DeltaIndex*>(delta);
           std::pair<KeyType, pid_t> kv{index->low_key, index->new_child_pid};
-          auto pos = std::lower_bound(output.begin(), output.end(), kv, cmp);
+          auto pos = std::lower_bound(output.begin(), --output.end(), kv, cmp);
           if (pos == output.end()) {
             output.back().first = index->low_key;
             output.emplace_back(KeyType(), index->new_child_pid);
@@ -1399,7 +1458,7 @@ class BWTree {
         case Node::NodeType::DeltaDeleteIndex: {
           DeltaDeleteIndex* del = static_cast<DeltaDeleteIndex*>(delta);
           std::pair<KeyType, pid_t> kv{del->deleted_key, del->deleted_pid};
-          auto pos = std::lower_bound(output.begin(), output.end(), kv, cmp);
+          auto pos = std::lower_bound(output.begin(), --output.end(), kv, cmp);
           output.erase(pos);
           deleted++;
           break;
@@ -1427,7 +1486,8 @@ class BWTree {
         "CollapseInnerData: Found %u inserted, %u deleted, chain length %u, "
         "base page size %u, size after insertions/deletions/splits/merges %lu",
         inserted, deleted, chain_length + 1, base_size - 1, output.size() - 1);
-    assert(std::is_sorted(output.begin(), output.end(), cmp));
+    assert(std::is_sorted(output.begin(), --output.end(),
+                          KeyOnlyComparator{key_comparator_}));
 #ifndef NDEBUG
     // Make sure the output is sorted by keys and contains no duplicate
     // key-value pairs
@@ -1838,18 +1898,16 @@ class BWTree {
 
   void ConsolidateInnerNode(pid_t node_pid) {
     uint32_t attempt = 0;
-    Node* node = nullptr;
-    InnerNode* consolidated = nullptr;
-    do {
+    while (true) {
       // Get the current node
-      node = GetNode(node_pid);
+      Node* node = GetNode(node_pid);
+      assert(!IsLeaf(node));
       if (IsDeleted(node)) {
         // If someone snuck in and deleted the node before we could consolidate
         // it, then we're really kind of done.  We just mark the node(+chain)
         // to be deleted in this epoch
         // TODO: Mark deleted
-        LOG_DEBUG("Looks like inner-node %lu was deleted, not touching ...",
-                  node_pid);
+        LOG_DEBUG("Inner-node %lu was deleted, skipping", node_pid);
         return;
       } else if (!NeedsConsolidation(node)) {
         LOG_DEBUG("Node [%lu] no longer needs consolidation", node_pid);
@@ -1862,65 +1920,67 @@ class BWTree {
       // Consolidate data
       std::vector<std::pair<KeyType, pid_t>> vals;
       std::pair<pid_t, pid_t> links = CollapseInnerNodeData(node, vals);
+      std::pair<KeyType, pid_t> rightmost = vals.back();
+      vals.pop_back();
 
       // New leaf node, populate keys and values
-      consolidated = InnerNode::Create(vals.front().first, vals.back().first,
-                                       links.first, links.second, vals.size());
-      for (uint32_t i = 0; i < vals.size() - 1; i++) {
+      auto* consolidated =
+          InnerNode::Create(vals.front().first, vals.back().first,
+                            links.first, links.second, vals.size());
+      for (uint32_t i = 0; i < vals.size(); i++) {
         consolidated->keys[i] = vals[i].first;
         consolidated->children[i] = vals[i].second;
       }
-      consolidated->children[vals.size()] = vals.back().second;
-    } while (!mapping_table_.Cas(node_pid, node, consolidated));
+      consolidated->children[vals.size()] = rightmost.second;
 
-    // Mark the node as deleted
-    assert(node != nullptr);
-    epoch_manager_.MarkDeleted(NodeDeleter{this, node});
-    LOG_DEBUG("Inner-node %lu consolidation successful, marking for deletion",
-              node_pid);
+      // CAS
+      if (mapping_table_.Cas(node_pid, node, consolidated)) {
+        epoch_manager_.MarkDeleted(NodeDeleter{this, node});
+        LOG_DEBUG("Inner-node [%lu] consolidation successful, marking for deletion",
+                  node_pid);
+        return;
+      }
+    }
   }
 
   void ConsolidateLeafNode(pid_t node_pid) {
-    uint32_t attempt = 0;
-    Node* node = nullptr;
-    LeafNode* consolidated = nullptr;
-    do {
+    while (true) {
       // Get the current node
-      node = GetNode(node_pid);
+      Node* node = GetNode(node_pid);
       if (IsDeleted(node)) {
-        // If someone snuck in and deleted the node before we could consolidate
-        // it, then we're really kind of done.  We just mark the node(+chain)
-        // to be deleted in this epoch
-        // TODO: Mark deleted
-        LOG_DEBUG("Looks like leaf-node %lu was deleted, not touching ...",
-                  node_pid);
+        LOG_DEBUG("Leaf-node %lu (%p) was deleted, skipping", node_pid, node);
         return;
       } else if (GetChainLength(node) < chain_length_threshold) {
         LOG_DEBUG("Node [%lu] no longer needs consolidation", node_pid);
         return;
       }
 
-      LOG_DEBUG("Consolidating leaf-node %lu (%p). Attempt %u", node_pid, node,
-                attempt++);
+      LOG_DEBUG("Attempting to consolidate leaf-node %lu (%p)", node_pid, node);
 
       // Consolidate data
       std::vector<std::pair<KeyType, ValueType>> vals;
       std::pair<pid_t, pid_t> links = CollapseLeafData(node, vals);
 
       // New leaf node, populate keys and values
-      consolidated = LeafNode::Create(vals.front().first, vals.back().first,
-                                      links.first, links.second, vals.size());
+      auto* consolidated =
+          LeafNode::Create(vals.front().first, vals.back().first,
+                           links.first, links.second, vals.size());
       for (uint32_t i = 0; i < vals.size(); i++) {
         consolidated->keys[i] = vals[i].first;
         consolidated->vals[i] = vals[i].second;
       }
-    } while (!mapping_table_.Cas(node_pid, node, consolidated));
 
-    // Mark the node as deleted
-    assert(node != nullptr);
-    epoch_manager_.MarkDeleted(NodeDeleter{this, node});
-    LOG_DEBUG("Leaf %lu (%p) consolidation complete, marking for deletion",
-              node_pid, node);
+      if (mapping_table_.Cas(node_pid, node, consolidated)) {
+        // Mark the node as deleted
+        assert(node != nullptr);
+        epoch_manager_.MarkDeleted(NodeDeleter{this, node});
+        LOG_DEBUG("Leaf %lu (%p) successfully consolidated to (%p)", node_pid,
+                  node, consolidated);
+        return;
+      }
+
+      LOG_DEBUG("Leaf %lu (%p) consolidation failed, retrying ", node_pid, node);
+    }
   }
 
   // Get the node with the given pid
@@ -2078,9 +2138,6 @@ class BWTree {
   std::atomic<uint64_t> num_failed_cas_;
   std::atomic<uint64_t> num_consolidations_;
   std::atomic<uint64_t> size_in_bytes_;
-
-  bool first_ = true;
-  KeyType last_;
 };
 
 }  // End index namespace

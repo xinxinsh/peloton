@@ -370,6 +370,7 @@ class BWTree {
     // K_Q
     KeyType high_key;
     pid_t new_child_pid;
+    bool rightmost;
 
     static DeltaIndex* Create(KeyType low_key, KeyType high_key,
                               pid_t new_child_pid, uint32_t num_entries,
@@ -684,11 +685,11 @@ class BWTree {
     epoch_manager_.Init();
   }
 
-  void InstallIndexDelta(const pid_t left_pid, const pid_t right_pid,
+  void InstallIndexDelta(const pid_t split_node_pid, const pid_t right_pid,
                          const KeyType low_key, const KeyType high_key,
                          std::vector<std::pair<pid_t, KeyType>>& traversal) {
     while (true) {
-      // Find the correct parent of the left_pid node
+      // Find the correct parent of the split_node_pid node
       pid_t parent_pid = kInvalidPid;
 
       if (!traversal.empty()) {
@@ -699,7 +700,7 @@ class BWTree {
               parent_pid = traversal[i].first;
               break;
             }
-          } else if (traversal[i].first == left_pid) {
+          } else if (traversal[i].first == split_node_pid) {
             found_left = true;
           }
         }
@@ -708,11 +709,11 @@ class BWTree {
       // If parent == nullptr, when we're creating a new root
       if (parent_pid == kInvalidPid) {
         LOG_DEBUG("Node [%lu] is the root, we'll be creating a new root!",
-                  left_pid);
+                  split_node_pid);
         auto* new_root =
             InnerNode::Create(low_key, high_key, kInvalidPid, kInvalidPid, 1);
         new_root->keys[0] = low_key;
-        new_root->children[0] = left_pid;
+        new_root->children[0] = split_node_pid;
         new_root->children[1] = right_pid;
 
         // Insert new root into mapping table
@@ -727,7 +728,7 @@ class BWTree {
           LOG_DEBUG(
               "New root [%lu] created with left child [%lu] and right "
               "child [%lu] (i.e., num_entries = %u)",
-              new_root_pid, left_pid, right_pid, new_root->num_entries);
+              new_root_pid, split_node_pid, right_pid, new_root->num_entries);
           break;
         }
 
@@ -737,7 +738,7 @@ class BWTree {
 
       } else {
         LOG_DEBUG("Parent of [%lu] is [%lu]. We'll install the delta on it.",
-                  left_pid, parent_pid);
+                  split_node_pid, parent_pid);
 
         // Before inserting the delta, check if some other thread snuck in and
         // inserted the delta index node we intended to
@@ -748,7 +749,7 @@ class BWTree {
 
         for (uint32_t i = 0; i < entries.size(); i++) {
           if (KeyEqual(low_key, entries[i].first) &&
-              left_pid == entries[i].second) {
+              split_node_pid == entries[i].second) {
             // Someone inserted the delta index term already, we don't have to
             LOG_DEBUG("Another thread inserted the delta index node. Skipping");
             return;
@@ -758,6 +759,7 @@ class BWTree {
         // Try to insert
         auto* index = DeltaIndex::Create(low_key, high_key, right_pid,
                                          NodeSize(parent) + 1, parent);
+        index->rightmost = right_pid == rightmost_leaf_pid_.load();
         if (mapping_table_.Cas(parent_pid, parent, index)) {
           // Successful Cas
           LOG_DEBUG(
@@ -828,9 +830,10 @@ class BWTree {
 
         uint32_t split_idx = entries.size() / 2;
         uint32_t num_entries = entries.size() - split_idx;
-        split_key = entries[split_idx].first;
-        auto* new_leaf = LeafNode::Create(split_key, entries.back().first,
-                                          node_pid, links.second, num_entries);
+        split_key = entries[split_idx - 1].first;
+        auto* new_leaf =
+            LeafNode::Create(entries[split_idx].first, entries.back().first,
+                             node_pid, links.second, num_entries);
         for (uint32_t i = split_idx; i < entries.size(); i++) {
           new_leaf->keys[i - split_idx] = entries[i].first;
           new_leaf->vals[i - split_idx] = entries[i].second;
@@ -844,10 +847,10 @@ class BWTree {
 
         uint32_t split_idx = entries.size() / 2;
         uint32_t num_entries = entries.size() - split_idx;
-        split_key = entries[split_idx].first;
-        InnerNode* new_inner =
-            InnerNode::Create(split_key, entries.back().first, node_pid,
-                              links.second, num_entries);
+        split_key = entries[split_idx - 1].first;
+        auto* new_inner =
+            InnerNode::Create(entries[split_idx].first, entries.back().first,
+                              node_pid, links.second, num_entries);
         for (uint32_t i = split_idx; i < entries.size() - 1; i++) {
           new_inner->keys[i - split_idx] = entries[i].first;
           new_inner->children[i - split_idx] = entries[i].second;
@@ -879,7 +882,7 @@ class BWTree {
         split = DeltaSplit::CreateInner(split_key, high_key, new_right_pid,
                                         new_left_size, node);
       }
-      LOG_DEBUG("Attempting to CAS split-delta [%lu]", node_pid);
+
       if (mapping_table_.Cas(node_pid, node, split)) {
         // Success, proceed to the next step
         LOG_DEBUG("Successful CAS of split-delta onto node [%lu] (%p)",
@@ -931,6 +934,15 @@ class BWTree {
     // Enter the epoch
     EpochGuard<NodeDeleter> guard{epoch_manager_};
 
+#if 0
+    if (first_) {
+      first_ = true;
+    } else {
+      assert(KeyLessEqual(last_, key));
+    }
+    last_ = key;
+#endif
+
     uint32_t attempt = 0;
     while (true) {
       // Find the leaf-level node where we'll insert the data
@@ -943,7 +955,8 @@ class BWTree {
 
       // Probe the leaf node to find if this is a duplicate
       if (unique_keys_) {
-        auto probe_result = FindInLeafNode(leaf, key, value);
+        auto probe_result = FindInLeafNode(result.node_pid, key, value,
+                                           result.traversal_path);
         bool exists = probe_result.first;
         //bool leaf_needs_consolidation = probe_result.second;
         if (exists) {
@@ -992,7 +1005,8 @@ class BWTree {
     Node* prev_root = result.node;
     uint32_t num_entries = NodeSize(prev_root);
 
-    auto probe_result = FindInLeafNode(result.node, key, value);
+    auto probe_result = FindInLeafNode(result.node_pid, key, value,
+                                       result.traversal_path);
     bool exists = probe_result.first;
     bool leaf_needs_consolidation = probe_result.second;
     if (!exists) {
@@ -1191,7 +1205,7 @@ class BWTree {
           // to the child this index entry points to
           const auto* index = static_cast<const DeltaIndex*>(curr_node);
           if (KeyLess(index->low_key, key) &&
-              KeyLessEqual(key, index->high_key)) {
+              (index->rightmost || KeyLessEqual(key, index->high_key))) {
             FindInnerNodeResult result;
             result.low_separator = index->low_key;
             result.high_separator = index->high_key;
@@ -1220,9 +1234,6 @@ class BWTree {
           result.child = kInvalidPid;
           result.needs_consolidation = chain_length >= chain_length_threshold;
           return result;
-        }
-        case Node::NodeType::Leaf: {
-          LOG_DEBUG("WTF Leaf?!");
         }
         default: {
           // Anything else should be impossible for inner nodes
@@ -1260,12 +1271,12 @@ class BWTree {
   }
 
   // Find the given key in the provided leaf node.
-  std::pair<bool, bool> FindInLeafNode(const Node* node, const KeyType key,
-                                       const ValueType val) {
-    assert(IsLeaf(node));
-
+  std::pair<bool, bool> FindInLeafNode(
+      const pid_t node_pid, const KeyType key, const ValueType val,
+      std::vector<std::pair<pid_t, KeyType>>& traversal) {
+    const Node* curr = GetNode(node_pid);
+    assert(IsLeaf(curr));
     uint32_t chain_length = 0;
-    const Node* curr = node;
     while (curr->node_type != Node::NodeType::Leaf) {
       switch (curr->node_type) {
         case Node::NodeType::DeltaInsert: {
@@ -1302,6 +1313,9 @@ class BWTree {
           if (KeyLess(key, split->split_key)) {
             curr = split->next;
           } else {
+            // Complete the SMO
+            InstallIndexDelta(node_pid, split->new_right, split->split_key,
+                              split->high_key, traversal);
             curr = GetNode(split->new_right);
           }
           break;
@@ -1373,7 +1387,12 @@ class BWTree {
           DeltaIndex* index = static_cast<DeltaIndex*>(delta);
           std::pair<KeyType, pid_t> kv{index->low_key, index->new_child_pid};
           auto pos = std::lower_bound(output.begin(), output.end(), kv, cmp);
-          output.insert(pos, kv);
+          if (pos == output.end()) {
+            output.back().first = index->low_key;
+            output.emplace_back(KeyType(), index->new_child_pid);
+          } else {
+            output.insert(pos, kv);
+          }
           inserted++;
           break;
         }
@@ -2059,6 +2078,9 @@ class BWTree {
   std::atomic<uint64_t> num_failed_cas_;
   std::atomic<uint64_t> num_consolidations_;
   std::atomic<uint64_t> size_in_bytes_;
+
+  bool first_ = true;
+  KeyType last_;
 };
 
 }  // End index namespace

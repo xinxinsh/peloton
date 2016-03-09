@@ -435,7 +435,7 @@ class BWTree {
     KeyType deleted_key;
     pid_t deleted_pid;
 
-    static DeltaIndex* Create(KeyType low_key, KeyType high_key,
+    static DeltaDeleteIndex* Create(KeyType low_key, KeyType high_key,
         pid_t owner, KeyType deleted_key, pid_t deleted_pid,
         uint32_t num_entries, Node *next) {
       auto* index = new DeltaDeleteIndex();
@@ -448,6 +448,10 @@ class BWTree {
       index->next = next;
       return index;
     }
+  };
+
+  // Mark for delete in merge. No extra member needed so far
+  struct DeltaRemove : public DeltaNode {
   };
 
   //===--------------------------------------------------------------------===//
@@ -1123,6 +1127,7 @@ class BWTree {
     KeyType low_key;
     KeyType high_key;
     pid_t left_sibling_pid = kInvalidPid;
+    LOG_DEBUG("left sibling %lu", left_sibling_pid);
     bool we_did_merge = false;
 
     // Step 1: Mark the node to be merged as deleted
@@ -1133,9 +1138,10 @@ class BWTree {
       // If the node has been deleted (for some reason, due to another merge),
       // we don't do anything
       if (IsDeleted(node)) {
+        LOG_DEBUG("Node already deleted, exit");
         return;
       }
-      DeltaNode *mark_for_delete = new DeltaNode();
+      DeltaRemove *mark_for_delete = new DeltaRemove();
       mark_for_delete->next = node;
 
       if (is_leaf) {
@@ -1145,9 +1151,9 @@ class BWTree {
       }
       bool cas_succ = mapping_table_.Cas(node_pid, node, mark_for_delete);
       if (cas_succ) {
-        // Failed. Retry
          break;
       }
+      // Failed. Retry
       delete mark_for_delete;
     }
 
@@ -1157,66 +1163,69 @@ class BWTree {
     while (true) {
       Node* node = GetNode(node_pid);
       bool is_leaf = IsLeaf(node);
-
-      if (IsDeleted(node))
-        return;
-
+      if (is_leaf) {
+        LOG_TRACE("Current node is leaf node");
+      } else {
+        LOG_TRACE("Current node is inner node");
+      }
       bool leftmost = false;
+      pid_t right_node_pid = kInvalidPid;;
       DeltaMerge* merge = nullptr;
+      uint32_t num_entries = 0;
 
       if (is_leaf) {
         // Leaf
-        left_node_pid = GetLeaf(node)->left_link;
+        std::vector<std::pair<KeyType, ValueType>> entries;
+        std::pair<pid_t, pid_t> links = CollapseLeafData(node, entries);
+        left_node_pid = std::get<0>(links);
+        right_node_pid = std::get<1>(links);
         if (left_node_pid == kInvalidPid) {
-          left_node_pid = getLeaf(node)->right_link;
+          if (right_node_pid == kInvalidPid)
+            return;
+          left_node_pid = std::get<1>(links);
           leftmost = true;
         }
         left_node = GetNode(left_node_pid);
 
-        std::vector<std::pair<KeyType, ValueType>> entries;
-        std::pair<pid_t, pid_t> links;
         std::vector<std::pair<KeyType, ValueType>> left_entries;
-        std::pair<pid_t, pid_t> left_links;
-        if (leftmost) {
-          links = CollapseLeafData(left_node, left_entries);
-          left_links = CollapseLeafData(node, entries);
+        CollapseLeafData(left_node, left_entries);
+        if (!leftmost) {
+          merge_key = std::get<0>(entries.front());
+          low_key = std::get<0>(left_entries.front());
+          high_key = std::get<0>(entries.back());
         } else {
-         links = CollapseLeafData(node, entries);
-         left_links = CollapseLeafData(left_node, left_entries);
+          merge_key = std::get<0>(left_entries.front());
+          low_key = std::get<0>(entries.front());
+          high_key = std::get<0>(left_entries.back());
         }
-
-        uint32_t num_entries = entries.size() + left_entries.size();
-        merge_key = std::get<0>(left_entries.front());
-        low_key = std::get<0>(entries.front());
-        high_key = std::get<0>(left_entries.back());
+        num_entries = entries.size() + left_entries.size();
         merge = DeltaMerge::CreateLeaf(merge_key, node_pid, node,
                                        num_entries, left_node);
       } else {
-        left_node_pid = GetInner(node)->left_link;
+        // Inner
+        std::vector<std::pair<KeyType, pid_t>> entries;
+        std::pair<pid_t, pid_t> links = CollapseInnerNodeData(node, entries);
+        left_node_pid = std::get<0>(links);
         if (left_node_pid == kInvalidPid) {
-          left_node_pid = getLeaf(node)->right_link;
+          left_node_pid = std::get<1>(links);
           leftmost = true;
         }
         left_node = GetNode(left_node_pid);
 
-        std::vector<std::pair<KeyType, pid_t>> entries;
-        std::pair<pid_t, pid_t> links;
         std::vector<std::pair<KeyType, pid_t>> left_entries;
-        std::pair<pid_t, pid_t> left_links;
-        if (leftmost) {
-          links = CollapseInnerData(left_node, left_entries);
-          left_links = CollapseInnderData(node, entries);
+        CollapseInnerNodeData(left_node, left_entries);
+        if (!leftmost) {
+          merge_key = std::get<0>(entries.front());
+          low_key = std::get<0>(left_entries.front());
+          high_key = std::get<0>(entries.back());
         } else {
-         links = CollapseInnderData(node, entries);
-         left_links = CollapseInnderData(left_node, left_entries);
+          merge_key = std::get<0>(left_entries.front());
+          low_key = std::get<0>(entries.front());
+          high_key = std::get<0>(left_entries.back());
         }
-
-        uint32_t num_entries = entries.size() + left_entries.size();
-        merge_key = std::get<0>(left_entries.front());
-        low_key = std::get<0>(entries.front());
-        high_key = std::get<0>(left_entries.back());
+        num_entries = entries.size() + left_entries.size();
         merge = DeltaMerge::CreateInner(merge_key, node_pid, node,
-                                       num_entries, left_node);
+                                        num_entries, left_node);
       }
 
       // Create merge delta node and try to CAS it into the left-node
@@ -1246,7 +1255,6 @@ class BWTree {
           node_pid);
     }
 
-    // TODO: change this
     // Try to install the delta delete into the parent inner node
     InstallIndexDeltaDelete(left_node_pid, node_pid, merge_key,
                             low_key, high_key, traversal);
@@ -1286,8 +1294,9 @@ class BWTree {
       prev_root = mapping_table_.Get(result.node_pid);
       delta_delete->next = prev_root;
     }
-    if (num_entries < delete_branch_factor) {
-      // Merge(result.leaf_node, node_pid, deltaInsert);
+    if (num_entries < delete_branch_factor &&
+        result.traversal_path.size() > 1) {
+      MergeNode(result.node_pid, result.traversal_path);
     }
     if (result.node_to_consolidate != kInvalidPid) {
       ConsolidateNode(result.node_to_consolidate);
@@ -1667,6 +1676,9 @@ class BWTree {
           right_sibling = split->new_right;
           break;
         }
+        case Node::NodeType::DeltaRemoveInner: {
+          break;
+        }
         default: {
           LOG_DEBUG("Hit node type %s when collapsing inner node. This is bad.",
                     std::to_string(delta->node_type).c_str());
@@ -1906,6 +1918,9 @@ class BWTree {
           DeltaSplit* split = static_cast<DeltaSplit*>(delta);
           output.erase(output.begin() + split->num_entries, output.end());
           right_sibling = split->new_right;
+          break;
+        }
+        case Node::NodeType::DeltaRemoveLeaf: {
           break;
         }
         default: {
@@ -2323,7 +2338,7 @@ class BWTree {
   EpochManager<NodeDeleter> epoch_manager_;
 
   // TODO: just a randomly chosen number now...
-  uint32_t delete_branch_factor = 100;
+  uint32_t delete_branch_factor = 3;
   uint32_t insert_branch_factor = 10;
   uint32_t chain_length_threshold = 10;
 

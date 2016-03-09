@@ -401,6 +401,7 @@ class BWTree {
                               pid_t new_child_pid, uint32_t num_entries,
                               Node* next) {
       auto* index = new DeltaIndex();
+      index->node_type = Node::NodeType::DeltaIndex;
       index->low_key = low_key;
       index->high_key = high_key;
       index->new_child_pid = new_child_pid;
@@ -558,9 +559,9 @@ class BWTree {
     // The comparator
     KeyComparator cmp;
 
-    bool operator()(const std::pair<KeyType, ValueType>& first,
-                    const std::pair<KeyType, ValueType>& second) const {
-      return cmp(first.first, second.first);
+    bool operator()(const std::pair<KeyType, ValueType>& lhs,
+                    const std::pair<KeyType, ValueType>& rhs) const {
+      return cmp(lhs.first, rhs.first);
     }
 
     bool operator()(const std::pair<KeyType, ValueType>& lhs,
@@ -573,9 +574,9 @@ class BWTree {
       return cmp(lhs, rhs.first);
     }
 
-    bool operator()(const std::pair<KeyType, pid_t>& first,
-                    const std::pair<KeyType, pid_t>& second) const {
-      return cmp(first.first, second.first);
+    bool operator()(const std::pair<KeyType, pid_t>& lhs,
+                    const std::pair<KeyType, pid_t>& rhs) const {
+      return cmp(lhs.first, rhs.first);
     }
 
     bool operator()(const std::pair<KeyType, pid_t>& lhs,
@@ -655,8 +656,9 @@ class BWTree {
         } else {
           LOG_DEBUG("Moving right to next tree node [%lu]", node_pid_);
           curr_idx_ = 0;
+          node_ = tree_.GetNode(node_pid_);
           collapsed_contents_.clear();
-          tree_.CollapseLeafData(tree_.GetNode(node_pid_), collapsed_contents_);
+          tree_.CollapseLeafData(node_, collapsed_contents_);
         }
       }
       return *this;
@@ -698,9 +700,10 @@ class BWTree {
   friend class NodeDeleter;
 
   // Constructor
-  BWTree(KeyComparator keyComparator, ValueComparator valueComparator,
-         KeyEqualityChecker equals)
-      : pid_allocator_(0),
+  BWTree(bool unique_keys, KeyComparator keyComparator,
+         ValueComparator valueComparator, KeyEqualityChecker equals)
+      : unique_keys_(unique_keys),
+        pid_allocator_(0),
         root_pid_(pid_allocator_++),
         leftmost_leaf_pid_(root_pid_.load()),
         rightmost_leaf_pid_(root_pid_.load()),
@@ -730,7 +733,7 @@ class BWTree {
 
       if (!traversal.empty()) {
         bool found_left = false;
-        for (uint32_t i = traversal.size() - 1; i >= 0; i--) {
+        for (int32_t i = traversal.size() - 1; i >= 0; i--) {
           if (found_left) {
             if (!IsDeleted(GetNode(traversal[i].first))) {
               parent_pid = traversal[i].first;
@@ -754,7 +757,8 @@ class BWTree {
 
         // Insert new root into mapping table
         pid_t new_root_pid = NextPid();
-        assert(mapping_table_.Insert(new_root_pid, new_root));
+        bool inserted = mapping_table_.Insert(new_root_pid, new_root);
+        assert(inserted);
 
         // CAS in
         pid_t old_root_pid = root_pid_.load();
@@ -762,8 +766,8 @@ class BWTree {
           // Successfully CASed in a new root
           LOG_DEBUG(
               "New root [%lu] created with left child [%lu] and right "
-              "child [%lu]",
-              new_root_pid, left_pid, right_pid);
+              "child [%lu] (i.e., num_entries = %u)",
+              new_root_pid, left_pid, right_pid, new_root->num_entries);
           break;
         }
 
@@ -772,7 +776,7 @@ class BWTree {
         delete new_root;
 
       } else {
-        LOG_DEBUG("Parent of node %lu is %lu. We'll install the delta on it.",
+        LOG_DEBUG("Parent of [%lu] is [%lu]. We'll install the delta on it.",
                   left_pid, parent_pid);
 
         // Before inserting the delta, check if some other thread snuck in and
@@ -786,6 +790,7 @@ class BWTree {
           if (KeyEqual(low_key, entries[i].first) &&
               left_pid == entries[i].second) {
             // Someone inserted the delta index term already, we don't have to
+            LOG_DEBUG("Another thread inserted the delta index node. Skipping");
             return;
           }
         }
@@ -795,10 +800,16 @@ class BWTree {
                                          NodeSize(parent) + 1, parent);
         if (mapping_table_.Cas(parent_pid, parent, index)) {
           // Successful Cas
+          LOG_DEBUG(
+              "Successfully CASed delta index entry into [%lu]. "
+              "Previous was (%p), new is (%p)",
+              parent_pid, parent, index);
           break;
         }
 
         // Failed CAS, retry
+        LOG_DEBUG("CAS failed to install delta index into [%lu], retrying",
+                  parent_pid);
         delete index;
       }
     }
@@ -889,7 +900,8 @@ class BWTree {
 
       // Step 2: Insert node holding right-half of split into mapping table
       new_right_pid = NextPid();
-      assert(mapping_table_.Insert(new_right_pid, new_right));
+      bool inserted = mapping_table_.Insert(new_right_pid, new_right);
+      assert(inserted);
 
       uint32_t new_left_size = NodeSize(node) - NodeSize(new_right);
       LOG_DEBUG(
@@ -970,13 +982,16 @@ class BWTree {
       uint32_t num_entries = NodeSize(leaf);
 
       // Probe the leaf node to find if this is a duplicate
-      auto probe_result = FindInLeafNode(leaf, key, value);
-      bool exists = probe_result.first;
-      bool leaf_needs_consolidation = probe_result.second;
-      if (exists) {
-        LOG_DEBUG("Attempted to insert duplicate key-value pair");
-        return false;
+      if (unique_keys_) {
+        auto probe_result = FindInLeafNode(leaf, key, value);
+        bool exists = probe_result.first;
+        //bool leaf_needs_consolidation = probe_result.second;
+        if (exists) {
+          LOG_DEBUG("Attempted to insert duplicate key-value pair");
+          return false;
+        }
       }
+      bool leaf_needs_consolidation = NeedsConsolidation(leaf);
 
       // At this point, everything is okay to insert the delta node for the
       // insertion.  Let's try to CAS in the delta insert node.
@@ -1351,7 +1366,6 @@ class BWTree {
     pid_t node_to_consolidate = kInvalidPid;
     // The PID of the node we're currently probing
     pid_t curr = root_pid_.load();
-    LOG_DEBUG("Starting at root [%lu]", curr);
     while (true) {
       assert(curr != kInvalidPid);
       Node* curr_node = GetNode(curr);
@@ -1365,7 +1379,8 @@ class BWTree {
         //       last delta (head of the chain) MUST be a DeltaRemoveNode.
         if (!IsDeleted(curr_node)) {
           // We've found the leaf
-          LOG_DEBUG("Found [%lu] leaf node", curr);
+          LOG_DEBUG("Ending at leaf [%lu] (%p)", curr, curr_node);
+          traversal.emplace_back(curr, KeyType());
           break;
         }
         curr = traversal.back().first;
@@ -1415,6 +1430,7 @@ class BWTree {
     uint32_t chain_length = 0;
     const Node* curr_node = node;
     while (curr_node->node_type != Node::NodeType::Inner) {
+      chain_length++;
       switch (curr_node->node_type) {
         case Node::NodeType::DeltaMergeInner: {
           const auto* merge = static_cast<const DeltaMerge*>(curr_node);
@@ -1447,7 +1463,12 @@ class BWTree {
           const auto* index = static_cast<const DeltaIndex*>(curr_node);
           if (KeyLess(index->low_key, key) &&
               KeyLessEqual(key, index->high_key)) {
-            curr_node = GetNode(index->new_child_pid);
+            FindInnerNodeResult result;
+            result.low_separator = index->low_key;
+            result.high_separator = index->high_key;
+            result.child = index->new_child_pid;
+            result.needs_consolidation = chain_length >= chain_length_threshold;
+            return result;
           } else {
             curr_node = index->next;
           }
@@ -1471,20 +1492,23 @@ class BWTree {
           result.needs_consolidation = chain_length >= chain_length_threshold;
           return result;
         }
+        case Node::NodeType::Leaf: {
+          LOG_DEBUG("WTF Leaf?!");
+        }
         default: {
           // Anything else should be impossible for inner nodes
-          LOG_DEBUG("Hit node %s on inner node traversal. This is impossible!",
+          LOG_DEBUG("Hit node type %s on inner node traversal. This is impossible!",
                     std::to_string(curr_node->node_type).c_str());
           assert(false);
         }
       }
-      chain_length++;
     }
 
-    LOG_DEBUG("Chain length for inner-node was %u", chain_length);
+    LOG_DEBUG("Chain length for inner-node [%lu] is %u", node_pid, chain_length);
 
     // Curr now points to the base inner node
     const auto* inner = static_cast<const InnerNode*>(curr_node);
+    LOG_DEBUG("Base inner node [%lu] size: %u", node_pid, inner->num_entries);
     auto iter = std::lower_bound(inner->keys, inner->keys + inner->num_entries,
                                  key, key_comparator_);
     uint32_t child_index = iter - inner->keys;
@@ -1506,9 +1530,7 @@ class BWTree {
     return result;
   }
 
-  // Find the given key in the provided leaf node.  If found, assign the value
-  // reference to the value from the leaf and return true. Otherwise, return
-  // false if not found in the leaf.
+  // Find the given key in the provided leaf node.
   std::pair<bool, bool> FindInLeafNode(const Node* node, const KeyType key,
                                        const ValueType val) {
     assert(IsLeaf(node));
@@ -1590,7 +1612,7 @@ class BWTree {
 
     std::stack<Node*, std::vector<Node*>> chain;
     Node* curr = node;
-    while (curr->node_type != Node::NodeType::Leaf) {
+    while (curr->node_type != Node::NodeType::Inner) {
       auto* delta = static_cast<DeltaNode*>(curr);
       chain.push(delta);
       curr = delta->next;
@@ -1605,6 +1627,7 @@ class BWTree {
       output.emplace_back(inner->keys[i], inner->children[i]);
     }
     output.emplace_back(KeyType(), inner->children[inner->num_entries]);
+    uint32_t base_size = output.size();
 
     pid_t left_sibling = inner->left_link;
     pid_t right_sibling = inner->right_link;
@@ -1654,15 +1677,17 @@ class BWTree {
 
     LOG_DEBUG(
         "CollapseInnerData: Found %u inserted, %u deleted, chain length %u, "
-        "base page size %lu",
-        inserted, deleted, chain_length + 1, output.size());
+        "base page size %u, size after insertions/deletions/splits/merges %lu",
+        inserted, deleted, chain_length + 1, base_size - 1, output.size() - 1);
     assert(std::is_sorted(output.begin(), output.end(), cmp));
 #ifndef NDEBUG
     // Make sure the output is sorted by keys and contains no duplicate
     // key-value pairs
-    for (uint32_t i = 1; i < output.size(); i++) {
-      assert(key_comparator_(output[i - 1].first, output[i].first) ||
-             output[i - 1].second != output[i].second);
+    if (unique_keys_) {
+      for (uint32_t i = 1; i < output.size(); i++) {
+        assert(KeyLess(output[i - 1].first, output[i].first) ||
+               output[i - 1].second != output[i].second);
+      }
     }
 #endif
 
@@ -1826,6 +1851,7 @@ class BWTree {
       chain.push(delta);
       curr = delta->next;
     }
+    uint32_t chain_length = chain.size() + 1;
 
     // Curr now points to the base leaf
     LeafNode* leaf = static_cast<LeafNode*>(curr);
@@ -1835,17 +1861,17 @@ class BWTree {
     for (uint32_t i = 0; i < leaf->num_entries; i++) {
       output.push_back(std::make_pair(leaf->keys[i], leaf->vals[i]));
     }
+    uint32_t base_size = output.size();
 
     pid_t left_sibling = leaf->left_link;
     pid_t right_sibling = leaf->right_link;
     uint32_t deleted = 0;
     uint32_t inserted = 0;
-    uint32_t chain_length = 0;
     // Process delta chain backwards
     while (!chain.empty()) {
+      assert(std::is_sorted(output.begin(), output.end(), cmp));
       DeltaNode* delta = static_cast<DeltaNode*>(chain.top());
       chain.pop();
-      chain_length++;
       switch (delta->node_type) {
         case Node::NodeType::DeltaInsert: {
           DeltaInsert* insert = static_cast<DeltaInsert*>(delta);
@@ -1858,15 +1884,17 @@ class BWTree {
         case Node::NodeType::DeltaDelete: {
           DeltaDelete* del = static_cast<DeltaDelete*>(delta);
           auto range = std::equal_range(output.begin(), output.end(), del->key, cmp);
-          for (auto iter = range.first, end = range.second; iter != end; ++iter) {
+          for (auto iter = range.first, end = range.second;
+               iter != end && iter != output.end(); ) {
             std::pair<KeyType, ValueType> key_value = *iter;
             if (KeyEqual(key_value.first, del->key) &&
                 ValueEqual(key_value.second, del->value)) {
-              output.erase(iter);
-              break;
+              iter = output.erase(iter);
+              deleted++;
+            } else {
+              iter++;
             }
           }
-          deleted++;
           break;
         }
         case Node::NodeType::DeltaMerge: {
@@ -1889,16 +1917,18 @@ class BWTree {
     }
     LOG_DEBUG(
         "CollapseLeafData: Found %u inserted, %u deleted, chain length %u, "
-        "base page size %lu",
-        inserted, deleted, chain_length + 1, output.size());
+        "base page size %u, size after insertions/deletions/splits/merges %lu",
+        inserted, deleted, chain_length, base_size, output.size());
     assert(std::is_sorted(output.begin(), output.end(), cmp));
 #ifndef NDEBUG
     // Make sure the output is sorted by keys and contains no duplicate
     // key-value pairs
-    for (uint32_t i = 1; i < output.size(); i++) {
-      bool equal_keys = KeyEqual(output[i - 1].first, output[i].first);
-      bool equal_vals = ValueEqual(output[i - 1].second, output[i].second);
-      assert(!(equal_keys && equal_vals));
+    if (unique_keys_) {
+      for (uint32_t i = 1; i < output.size(); i++) {
+        bool equal_keys = KeyEqual(output[i - 1].first, output[i].first);
+        bool equal_vals = ValueEqual(output[i - 1].second, output[i].second);
+        assert(!(equal_keys && equal_vals));
+      }
     }
 #endif
     return std::make_pair(left_sibling, right_sibling);
@@ -2073,6 +2103,9 @@ class BWTree {
         LOG_DEBUG("Looks like inner-node %lu was deleted, not touching ...",
                   node_pid);
         return;
+      } else if (!NeedsConsolidation(node)) {
+        LOG_DEBUG("Node [%lu] no longer needs consolidation", node_pid);
+        return;
       }
 
       LOG_DEBUG("Consolidating inner-node %lu (%p). Attempt %u", node_pid, node,
@@ -2113,6 +2146,9 @@ class BWTree {
         // TODO: Mark deleted
         LOG_DEBUG("Looks like leaf-node %lu was deleted, not touching ...",
                   node_pid);
+        return;
+      } else if (GetChainLength(node) < chain_length_threshold) {
+        LOG_DEBUG("Node [%lu] no longer needs consolidation", node_pid);
         return;
       }
 
@@ -2172,7 +2208,7 @@ class BWTree {
            node->node_type == Node::NodeType::DeltaRemoveInner;
   }
 
-  inline pid_t RightSibling(const Node* node) const {
+  pid_t RightSibling(const Node* node) const {
     assert(node != nullptr);
     const Node* curr = node;
     while (curr->node_type != Node::NodeType::Inner &&
@@ -2190,11 +2226,30 @@ class BWTree {
     return data_node->right_link;
   }
 
+  // Return the delta chain length of the given node
+  uint32_t GetChainLength(const Node* node) const {
+    // TODO: Put the chain length in the delta itself
+    uint32_t chain_length = 0;
+    const Node* curr = node;
+    while (curr->node_type != Node::NodeType::Inner &&
+           curr->node_type != Node::NodeType::Leaf) {
+      chain_length++;
+      const auto* delta = static_cast<const DeltaNode*>(curr);
+      curr = delta->next;
+    }
+    return chain_length;
+  }
+
+  bool NeedsConsolidation(const Node* node) const {
+    return GetChainLength(node) >= chain_length_threshold;
+  }
+
   // Return the size (i.e., the number of key-value or key-pid pairs) in this
   // logical node
   uint32_t NodeSize(const Node* node) const {
-    if (node->node_type == Node::NodeType::Leaf) {
-      return static_cast<const LeafNode*>(node)->num_entries;
+    if (node->node_type == Node::NodeType::Leaf ||
+        node->node_type == Node::NodeType::Inner) {
+      return static_cast<const DataNode*>(node)->num_entries;
     } else {
       return static_cast<const DeltaNode*>(node)->num_entries;
     }
@@ -2234,6 +2289,9 @@ class BWTree {
   pid_t NextPid() { return pid_allocator_++; }
 
  private:
+  // Does this index support duplicate keys?
+  bool unique_keys_;
+
   // PID allocator
   std::atomic<uint64_t> pid_allocator_;
 

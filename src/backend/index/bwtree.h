@@ -580,6 +580,17 @@ class BWTree {
   struct DeltaDelete : public DeltaNode {
     KeyType key;
     ValueType value;
+
+    static DeltaDelete* Create(KeyType key, ValueType val,
+                               uint32_t num_entries, Node* next) {
+      DeltaDelete* del = new DeltaDelete();
+      del->node_type = Node::NodeType::DeltaDelete;
+      del->key = key;
+      del->value = val;
+      del->num_entries = num_entries;
+      del->next = next;
+      return del;
+    }
   };
 
   //===--------------------------------------------------------------------===//
@@ -1379,45 +1390,46 @@ class BWTree {
     // Enter the epoch
     EpochGuard<NodeDeleter> guard{epoch_manager_};
 
-    // Find the leaf-level node where we'll insert the data
-    FindDataNodeResult result = FindDataNode(key);
-    assert(IsLeaf(result.node));
+    while (true) {
+      // Find the leaf-level node where we'll insert the data
+      FindDataNodeResult result = FindDataNode(key);
+      assert(IsLeaf(result.node));
 
-    auto probe_result =
-        FindInLeafNode(result.node_pid, key, value, result.traversal_path);
-    if (!probe_result.found) {
-      LOG_DEBUG("Attempted to delete non-existent key-value from index");
-      return false;
-    }
-    pid_t prev_root_pid = probe_result.leaf_pid;
-    Node* prev_root = probe_result.leaf;
-    uint32_t num_entries = NodeSize(prev_root);
-    bool leaf_needs_consolidation = NeedsConsolidation(prev_root);
+      auto probe_result =
+          FindInLeafNode(result.node_pid, key, value, result.traversal_path);
+      if (!probe_result.found) {
+        LOG_DEBUG("Attempted to delete non-existent key-value from index");
+        return false;
+      }
+      pid_t prev_root_pid = probe_result.leaf_pid;
+      Node* prev_root = probe_result.leaf;
+      uint32_t num_entries = NodeSize(prev_root);
+      bool leaf_needs_consolidation = NeedsConsolidation(prev_root);
 
-    // TODO: wrap in while loop for multi threaded cases
-    auto delta_delete = new DeltaDelete();
-    delta_delete->key = key;
-    delta_delete->value = value;
-    // TODO: make this class into c++ initializer list
-    delta_delete->node_type = Node::NodeType::DeltaDelete;
-    delta_delete->num_entries = num_entries - 1;
-    delta_delete->next = prev_root;
-
-    // Try to CAS
-    while (!mapping_table_.Cas(prev_root_pid, prev_root, delta_delete)) {
-      // TODO: need to retraverse in multithreading
-      prev_root = mapping_table_.Get(result.node_pid);
-      delta_delete->next = prev_root;
+      // TODO: wrap in while loop for multi threaded cases
+      auto delta_delete =
+          DeltaDelete::Create(key, value, num_entries - 1, prev_root);;
+      if (mapping_table_.Cas(prev_root_pid, prev_root, delta_delete)) {
+        // SUCCESS
+        AddAllocatedBytes(delta_delete);
+        if (num_entries < delete_branch_factor) {
+          // Merge(result.leaf_node, node_pid, deltaInsert);
+        }
+        // Consolidate we if need to
+        if (result.node_to_consolidate != kInvalidPid) {
+          ConsolidateNode(result.node_to_consolidate);
+        } else if (leaf_needs_consolidation) {
+          ConsolidateNode(result.node_pid);
+        }
+        LOG_DEBUG("Inserted delta delete to node %lu", prev_root_pid);
+        break;
+      } else {
+        // The CAS failed, delete the node and retry
+        LOG_DEBUG("Failed to CAS in delete delta, retrying");
+        num_failed_cas_++;
+        delete delta_delete;
+      }
     }
-    if (num_entries < delete_branch_factor) {
-      // Merge(result.leaf_node, node_pid, deltaInsert);
-    }
-    if (result.node_to_consolidate != kInvalidPid) {
-      ConsolidateNode(result.node_to_consolidate);
-    } else if (leaf_needs_consolidation) {
-      ConsolidateNode(result.node_pid);
-    }
-    LOG_DEBUG("Inserted delta delete to node %lu", result.node_pid);
     return true;
   }
 

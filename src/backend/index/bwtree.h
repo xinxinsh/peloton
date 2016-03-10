@@ -710,6 +710,12 @@ class BWTree {
     bool needs_consolidation;
   };
 
+  struct FindLeafNodeResult {
+    bool found;
+    pid_t leaf_pid;
+    Node* leaf;
+  };
+
   //===--------------------------------------------------------------------===//
   // The result of a search for a key in the tree
   //===--------------------------------------------------------------------===//
@@ -888,7 +894,8 @@ class BWTree {
         curr_idx_++;
       } else {
         // We've exhausted this node, find the next
-        pid_t node_pid_ = tree_.RightSibling(node_);
+        pid_t right_sibling_pid = tree_.RightSibling(node_);
+        node_pid_ = right_sibling_pid;
         if (node_pid_ == kInvalidPid) {
           // No more data
           //LOG_DEBUG("At right-most leaf, no more data");
@@ -1029,7 +1036,6 @@ class BWTree {
   void InstallIndexDelta(pid_t split_node_pid, pid_t right_pid,
                          KeyType low_key, KeyType high_key,
                          std::vector<std::pair<pid_t, KeyType>>& traversal) {
-    assert(KeyLessEqual(low_key, high_key));
     // Find the correct parent of the split_node_pid node
     pid_t parent_pid = kInvalidPid;
 
@@ -1086,16 +1092,16 @@ class BWTree {
       std::vector<std::pair<KeyType, pid_t>> entries;
       CollapseInnerNodeData(parent, entries);
 
-      for (uint32_t i = 0; i < entries.size(); i++) {
-        if (KeyEqual(low_key, entries[i].first) &&
-            split_node_pid == entries[i].second) {
-          // Someone inserted the delta index term already, we don't have to
+      for (uint32_t i = 0; i < entries.size() - 1; i++) {
+        if (KeyEqual(low_key, entries[i].first)) {
+            //split_node_pid == entries[i].second) {
           LOG_DEBUG("Another thread inserted the delta index node. Skipping");
           return;
         }
       }
 
       // Try to insert
+      assert(KeyLessEqual(low_key, high_key));
       auto* index = DeltaIndex::Create(low_key, high_key, right_pid,
                                        NodeSize(parent) + 1, parent);
       index->rightmost = right_pid == rightmost_leaf_pid_.load();
@@ -1106,9 +1112,6 @@ class BWTree {
             "Successfully CASed delta index entry into [%lu]. "
             "Previous was (%p), new is (%p)",
             parent_pid, parent, index);
-        std::vector<std::pair<KeyType, pid_t>> o;
-        CollapseInnerNodeData(index, o);
-        LOG_DEBUG("Visibility of new index check");
         return;
       }
 
@@ -1215,8 +1218,10 @@ class BWTree {
         for (uint32_t i = 1; i < traversal.size(); i++) {
           if (traversal[i].first == node_pid) {
             LOG_DEBUG("High-key of split taken from traversal");
-            high_key = traversal[i - 1].second;
-            break;
+            if (KeyLess(high_key, traversal[i-1].second)) {
+              high_key = traversal[i - 1].second;
+              break;
+            }
           }
         }
       }
@@ -1303,30 +1308,26 @@ class BWTree {
       assert(result.node != nullptr);
       assert(IsLeaf(result.node));
 
-      Node* leaf = result.node;
-      uint32_t num_entries = NodeSize(leaf);
-
       // Probe the leaf node to find if this is a duplicate
-      if (unique_keys_) {
-        auto probe_result = FindInLeafNode(result.node_pid, key, value,
-                                           result.traversal_path);
-        bool exists = probe_result.first;
-        //bool leaf_needs_consolidation = probe_result.second;
-        if (exists) {
-          LOG_DEBUG("Attempted to insert duplicate key-value pair");
-          return false;
-        }
+      auto probe_result = FindInLeafNode(result.node_pid, key, value,
+                                         result.traversal_path);
+      if (probe_result.found && unique_keys_) {
+        LOG_DEBUG("Attempted to insert duplicate key-value pair");
+        return false;
       }
+
+      pid_t leaf_pid = probe_result.leaf_pid;
+      Node* leaf = probe_result.leaf;
+      uint32_t num_entries = NodeSize(leaf);
       bool leaf_needs_consolidation = NeedsConsolidation(leaf);
 
       // At this point, everything is okay to insert the delta node for the
       // insertion.  Let's try to CAS in the delta insert node.
       auto* delta_insert =
           DeltaInsert::Create(key, value, leaf, num_entries + 1);
-      if (mapping_table_.Cas(result.node_pid, leaf, delta_insert)) {
+      if (mapping_table_.Cas(leaf_pid, leaf, delta_insert)) {
         // SUCCESS
         AddAllocatedBytes(delta_insert);
-        LOG_DEBUG("Installed delta insert into node [%lu]", result.node_pid);
         if (num_entries > insert_branch_factor) {
           // Split the leaf we inserted into
           SplitNode(result.node_pid, result.traversal_path);
@@ -1345,20 +1346,24 @@ class BWTree {
         delete delta_insert;
       }
     }
-#ifndef NDEBUG
+#if 0
     bool first = true;
     KeyType last;
+    pid_t last_pid = kInvalidPid;
     for (auto iter = begin(), e = end(); iter != e; ++iter) {
       if (!first) {
         if (!KeyLessEqual(last, iter.key())){
+          //KeyLess(last, iter.key(), true);
           pid_t n = iter.node();
           Node* node = GetNode(n);
-          LOG_DEBUG("Keys in %s [%lu] not sorted at %u", IsLeaf(node) ? "leaf" : "inner-node", n, iter.index());
+          LOG_DEBUG("Keys in %s [%lu] not sorted at %u, last pid %lu",
+                    IsLeaf(node) ? "leaf" : "inner-node", n, iter.index(), last_pid);
           assert(false);
         }
         //assert(KeyLessEqual(last, iter.key()));
       }
       last = iter.key();
+      last_pid = iter.node();
       first = false;
     }
 #endif
@@ -1373,17 +1378,16 @@ class BWTree {
     FindDataNodeResult result = FindDataNode(key);
     assert(IsLeaf(result.node));
 
-    Node* prev_root = result.node;
-    uint32_t num_entries = NodeSize(prev_root);
-
     auto probe_result = FindInLeafNode(result.node_pid, key, value,
                                        result.traversal_path);
-    bool exists = probe_result.first;
-    bool leaf_needs_consolidation = probe_result.second;
-    if (!exists) {
+    if (!probe_result.found) {
       LOG_DEBUG("Attempted to delete non-existent key-value from index");
       return false;
     }
+    pid_t prev_root_pid = probe_result.leaf_pid;
+    Node* prev_root = probe_result.leaf;
+    uint32_t num_entries = NodeSize(prev_root);
+    bool leaf_needs_consolidation = NeedsConsolidation(prev_root);
 
     // TODO: wrap in while loop for multi threaded cases
     auto delta_delete = new DeltaDelete();
@@ -1395,7 +1399,7 @@ class BWTree {
     delta_delete->next = prev_root;
 
     // Try to CAS
-    while (!mapping_table_.Cas(result.node_pid, prev_root, delta_delete)) {
+    while (!mapping_table_.Cas(prev_root_pid, prev_root, delta_delete)) {
       // TODO: need to retraverse in multithreading
       prev_root = mapping_table_.Get(result.node_pid);
       delta_delete->next = prev_root;
@@ -1572,7 +1576,6 @@ class BWTree {
           // If delta.low_key < key <= delta.high_key, then we follow the path
           // to the child this index entry points to
           const auto* index = static_cast<const DeltaIndex*>(curr_node);
-          LOG_DEBUG("Checking delta index");
           if (KeyLess(index->low_key, key) &&
               (index->rightmost || KeyLessEqual(key, index->high_key))) {
             FindInnerNodeResult result;
@@ -1637,35 +1640,44 @@ class BWTree {
   }
 
   // Find the given key in the provided leaf node.
-  std::pair<bool, bool> FindInLeafNode(
+  FindLeafNodeResult FindInLeafNode(
       const pid_t node_pid, const KeyType key, const ValueType val,
       std::vector<std::pair<pid_t, KeyType>>& traversal) {
-    const Node* curr = GetNode(node_pid);
+
+    FindLeafNodeResult result;
+
+    pid_t curr_pid = node_pid;
+    Node* root = GetNode(curr_pid);
+    Node* curr = root;
     assert(IsLeaf(curr));
-    uint32_t chain_length = 0;
     while (curr->node_type != Node::NodeType::Leaf) {
       switch (curr->node_type) {
         case Node::NodeType::DeltaInsert: {
           // Check if the inserted key is what we're looking for
-          const auto* insert = static_cast<const DeltaInsert*>(curr);
+          auto* insert = static_cast<DeltaInsert*>(curr);
           if (KeyEqual(key, insert->key) && ValueEqual(val, insert->value)) {
-            return std::make_pair(true, chain_length >= chain_length_threshold);
+            result.found = true;
+            result.leaf_pid = curr_pid;
+            result.leaf = root;
+            return result;
           }
           curr = insert->next;
           break;
         }
         case Node::NodeType::DeltaDelete: {
           // Check if the key we're looking for has been deleted
-          const auto* del = static_cast<const DeltaDelete*>(curr);
+          auto* del = static_cast<DeltaDelete*>(curr);
           if (KeyEqual(key, del->key) && ValueEqual(val, del->value)) {
-            return std::make_pair(false,
-                                  chain_length >= chain_length_threshold);
+            result.found = true;
+            result.leaf_pid = curr_pid;
+            result.leaf = root;
+            return result;
           }
           curr = del->next;
           break;
         }
         case Node::NodeType::DeltaMerge: {
-          const auto* merge = static_cast<const DeltaMerge*>(curr);
+          auto* merge = static_cast<DeltaMerge*>(curr);
           if (KeyLess(key, merge->merge_key)) {
             // The key is still in this logical node
             curr = merge->next;
@@ -1675,14 +1687,18 @@ class BWTree {
           break;
         }
         case Node::NodeType::DeltaSplit: {
-          const auto* split = static_cast<const DeltaSplit*>(curr);
-          if (KeyLess(key, split->split_key)) {
+          auto* split = static_cast<DeltaSplit*>(curr);
+          if (KeyLessEqual(key, split->split_key)) {
             curr = split->next;
           } else {
             // Complete the SMO
+            LOG_DEBUG("Seeing partial split of [%lu] into [%lu], complete first",
+                      curr_pid, split->new_right);
             InstallIndexDelta(node_pid, split->new_right, split->split_key,
                               split->high_key, traversal);
-            curr = GetNode(split->new_right);
+            curr_pid = split->new_right;
+            root = GetNode(curr_pid);
+            curr = root;
           }
           break;
         }
@@ -1692,13 +1708,10 @@ class BWTree {
           assert(false);
         }
       }
-      chain_length++;
     }
 
-    LOG_DEBUG("FindInLeafNode: Node chain length is %u", chain_length);
-
     // We're at the base leaf, just binary search the guy
-    const LeafNode* leaf = static_cast<const LeafNode*>(curr);
+    LeafNode* leaf = static_cast<LeafNode*>(curr);
 
     // TODO: We need a key-value comparator so that we can use binary search
     auto range = std::equal_range(leaf->keys, leaf->keys + leaf->num_entries,
@@ -1711,7 +1724,10 @@ class BWTree {
         break;
       }
     }
-    return std::make_pair(found, chain_length >= chain_length_threshold);
+    result.found = found;
+    result.leaf_pid = curr_pid;
+    result.leaf = root;
+    return result;
   }
 
   std::pair<pid_t, pid_t> CollapseInnerNodeData(
@@ -1772,7 +1788,10 @@ class BWTree {
             output.back().first = index->low_key;
             output.emplace_back(KeyType(), index->new_child_pid);
           } else {
+            uint32_t idx = pos - output.begin();
             output.insert(pos, kv);
+            output[idx].second = output[idx+1].second;
+            output[idx+1].second = index->new_child_pid;
           }
           inserted++;
           break;
@@ -2275,8 +2294,10 @@ class BWTree {
       if (mapping_table_.Cas(node_pid, node, consolidated)) {
         AddAllocatedBytes(consolidated);
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
-        LOG_DEBUG("Inner-node [%lu] consolidation successful, marking for deletion",
-                  node_pid);
+        LOG_DEBUG(
+            "SUCCESS: Inner node %lu consolidated to (%p). Old chain+node "
+            "(%p) marked as garbage",
+            node_pid, consolidated, node);
 
 #ifndef NDEBUG
         std::string out;
@@ -2331,8 +2352,10 @@ class BWTree {
         // Mark the node as deleted
         AddAllocatedBytes(consolidated);
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
-        LOG_DEBUG("Leaf %lu (%p) successfully consolidated to (%p)", node_pid,
-                  node, consolidated);
+        LOG_DEBUG(
+            "SUCCESS: Leaf %lu consolidated to (%p). Old chain+node "
+            "(%p) marked as garbage",
+            node_pid, consolidated, node);
         return;
       }
 
@@ -2508,7 +2531,6 @@ class BWTree {
       // Delete the delta's memory
       DeltaNode* delta = static_cast<DeltaNode*>(curr);
       MarkReclaimedBytes(delta);
-      size_in_bytes_ -= NodeSizeInBytes(delta);
       curr = delta->next;
       delete delta;
       chain_length++;

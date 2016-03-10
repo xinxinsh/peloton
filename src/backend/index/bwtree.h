@@ -319,7 +319,7 @@ class MappingTable {
   MappingTable() : MappingTable(1 << 20) {}
 
   MappingTable(uint32_t initial_size) : size_(initial_size) {
-    table_ = new Entry*[initial_size];
+    table_ = new Entry* [initial_size];
     for (uint32_t i = 0; i < initial_size; i++) {
       table_[i] = nullptr;
     }
@@ -581,8 +581,8 @@ class BWTree {
     KeyType key;
     ValueType value;
 
-    static DeltaDelete* Create(KeyType key, ValueType val,
-                               uint32_t num_entries, Node* next) {
+    static DeltaDelete* Create(KeyType key, ValueType val, uint32_t num_entries,
+                               Node* next) {
       DeltaDelete* del = new DeltaDelete();
       del->node_type = Node::NodeType::DeltaDelete;
       del->key = key;
@@ -1408,7 +1408,7 @@ class BWTree {
 
       // TODO: wrap in while loop for multi threaded cases
       auto delta_delete =
-          DeltaDelete::Create(key, value, num_entries - 1, prev_root);;
+          DeltaDelete::Create(key, value, num_entries - 1, prev_root);
       if (mapping_table_.Cas(prev_root_pid, prev_root, delta_delete)) {
         // SUCCESS
         AddAllocatedBytes(delta_delete);
@@ -2335,7 +2335,7 @@ class BWTree {
 
   // TODO: just a randomly chosen number now...
   uint32_t delete_branch_factor = 100;
-  uint32_t insert_branch_factor = 10;
+  uint32_t insert_branch_factor = (1024 * 64) / (sizeof(KeyType) + sizeof(ValueType));
   uint32_t chain_length_threshold = 10;
 
   std::atomic<uint64_t> num_failed_cas_;

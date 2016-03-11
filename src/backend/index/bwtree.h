@@ -79,6 +79,7 @@ class EpochManager {
     DeletionGroup* head = nullptr;
     DeletionGroup* tail = nullptr;
     DeletionGroup* free_to_use_groups = nullptr;
+    DeletionList* next = nullptr;
 
     ~DeletionList() {
       LOG_DEBUG("Freeing all memory in all deletion groups during shutdown");
@@ -97,6 +98,10 @@ class EpochManager {
         DeletionGroup* tmp = free_to_use_groups;
         free_to_use_groups = free_to_use_groups->next_group;
         delete tmp;
+      }
+
+      if (next != nullptr) {
+        delete next;
       }
     }
 
@@ -161,6 +166,8 @@ class EpochManager {
         LOG_DEBUG("Freed %u objects before epoch %lu", freed, epoch);
       }
     }
+
+    bool Empty() { return head == nullptr; }
   };
 
   // Captures the state information for every thread that participates in
@@ -169,23 +176,32 @@ class EpochManager {
   //       because we guarantee that all mutations are performed by
   //       a single thread (the thread whose state it represents)
   struct ThreadState {
+    EpochManager* em;
     bool initialized = false;
-    volatile epoch_t local_epoch = 0;
-    DeletionList deletion_list;
+    std::atomic<epoch_t> local_epoch{0};
+    DeletionList* deletion_list = new DeletionList();
+    uint32_t nest = 0;
     uint32_t added = 0;
     uint32_t deleted = 0;
+
+    ThreadState(EpochManager* _em) : em(_em) { em->Register(this); }
+
+    ~ThreadState() { em->Unregister(this); }
   };
 
   // Get the epoch thread state for the currently executing thread
-  ThreadState* GetThreadState() {
-    static thread_local ThreadState thread_state;
+  ThreadState* GetThreadState(EpochManager* em) {
+    static thread_local ThreadState thread_state{em};
     return &thread_state;
   }
 
- public:
   // Constructor
   EpochManager()
-      : global_epoch_(0), lowest_epoch_(0), stop_(false), epoch_mover_() {
+      : global_epoch_(0),
+        lowest_epoch_(0),
+        registered_(0),
+        stop_(false),
+        epoch_mover_(std::thread{&EpochManager::EpochTicker, this}) {
     /* Nothing */
   }
 
@@ -195,9 +211,42 @@ class EpochManager {
     epoch_mover_.join();
   }
 
-  void Init() {
-    // Start the epoch ticker thread
-    epoch_mover_ = std::thread{&EpochManager::EpochTicker, this};
+  void Register(ThreadState* ts) {
+    ts->initialized = true;
+    std::lock_guard<std::mutex> lock{states_mutex_};
+    if (thread_states_.find(std::this_thread::get_id()) ==
+        thread_states_.end()) {
+      thread_states_[std::this_thread::get_id()] = ts;
+      ++registered_;
+      // uint64_t r = ++registered_;
+      // LOG_DEBUG("Registered new thread, total: %lu", r);
+    }
+  }
+
+  void Unregister(ThreadState* ts) {
+    assert(ts->initialized);
+
+    // Remove state from map
+    std::lock_guard<std::mutex> lock{states_mutex_};
+    assert(thread_states_.find(std::this_thread::get_id()) !=
+           thread_states_.end());
+    thread_states_.erase(std::this_thread::get_id());
+
+    // Move deletion list to zombies
+    ts->deletion_list->next = zombies_;
+    zombies_ = ts->deletion_list;
+    ts->deletion_list = nullptr;
+
+    assert(registered_.load() > 0);
+    --registered_;
+    // uint64_t r = --registered_;
+    // LOG_DEBUG("Unregistered thread, still registered: %lu", r);
+  }
+
+ public:
+  static EpochManager& GetInstance() {
+    static EpochManager instance_;
+    return instance_;
   }
 
   void EpochTicker() {
@@ -221,30 +270,48 @@ class EpochManager {
         epoch_t lowest = global_epoch_.load();
         for (const auto& iter : thread_states_) {
           ThreadState* state = iter.second;
-          if (state->local_epoch < lowest) {
-            lowest = state->local_epoch;
+          epoch_t local_epoch = state->local_epoch.load();
+          if (local_epoch < lowest) {
+            lowest = local_epoch;
           }
         }
         lowest_epoch_.store(lowest);
+
+        // Try to cleanup zombied deletion lists
+        DeletionList* curr = zombies_;
+        while (curr != nullptr) {
+          curr->Free(lowest);
+          curr = curr->next;
+        }
       }
       LOG_DEBUG("Global epoch: %lu, lowest epoch: %lu, # states: %u",
                 global_epoch_.load(), lowest_epoch_.load(), num_states);
       assert(lowest_epoch_.load() <= global_epoch_.load());
     }
+
     LOG_DEBUG("Shutting down epoch ticker thread");
+    while (registered_.load() > 0) {
+      std::this_thread::sleep_for(sleep_duration);
+    }
+    LOG_DEBUG(
+        "All threads unregistered, deleting all memory from deletion lists");
+    {
+      std::lock_guard<std::mutex> lock{states_mutex_};
+      if (zombies_ != nullptr) {
+        delete zombies_;
+      }
+    }
+    LOG_DEBUG("Epoch management thread done");
   }
 
   // Called by threads that want to enter the current epoch, indicating that
   // it will need all resources that are visible in this epoch
   void EnterEpoch() {
-    auto* self_state = GetThreadState();
-    if (!self_state->initialized) {
-      // do init
-      self_state->initialized = true;
-      std::lock_guard<std::mutex> lock{states_mutex_};
-      thread_states_[std::this_thread::get_id()] = self_state;
+    auto* self_state = GetThreadState(this);
+    assert(self_state->initialized);
+    if (self_state->nest++ == 0) {
+      self_state->local_epoch.store(GetCurrentEpoch());
     }
-    self_state->local_epoch = GetCurrentEpoch();
   }
 
   // Called by a thread that wishes to mark the provided freeable entity as
@@ -255,22 +322,25 @@ class EpochManager {
   // Note: The Freeable type must have a Free(...) function that can be called
   //       to physically free the memory
   void MarkDeleted(Freeable freeable) {
-    auto* self_state = GetThreadState();
+    auto* self_state = GetThreadState(this);
     assert(self_state->initialized);
+    assert(self_state->nest > 0);
 
     // Get the deletion list for the thread and mark the ptr as deleted by
     // this thread in the thread's local epoch
-    auto& deletion_list = self_state->deletion_list;
-    deletion_list.MarkDeleted(freeable, self_state->local_epoch);
+    auto* deletion_list = self_state->deletion_list;
+    deletion_list->MarkDeleted(freeable, self_state->local_epoch.load());
   }
 
   // The thread wants to exit the epoch, indicating it no longer needs
   // protected access to the data
   void ExitEpoch() {
-    auto* self_state = GetThreadState();
+    auto* self_state = GetThreadState(this);
     assert(self_state->initialized);
-    auto& deletion_list = self_state->deletion_list;
-    deletion_list.Free(lowest_epoch_.load());
+    if (--self_state->nest == 0) {
+      auto* deletion_list = self_state->deletion_list;
+      deletion_list->Free(lowest_epoch_.load());
+    }
   }
 
   // Get the current epoch
@@ -282,6 +352,8 @@ class EpochManager {
   // The current minimum epoch that any transaction is in
   std::atomic<epoch_t> lowest_epoch_;
 
+  std::atomic<uint32_t> registered_;
+
   // The thread that increments the epoch
   std::atomic<bool> stop_;
   std::thread epoch_mover_;
@@ -289,6 +361,7 @@ class EpochManager {
   // The map from threads to their states, and mutex that protects it
   std::mutex states_mutex_;
   std::unordered_map<std::thread::id, ThreadState*> thread_states_;
+  DeletionList* zombies_;
 };
 
 //===--------------------------------------------------------------------===//
@@ -307,109 +380,6 @@ class EpochGuard {
  private:
   // The epoch manager
   EpochManager<Type>& em_;
-};
-
-//===--------------------------------------------------------------------===//
-// The mapping table.  Right now it's fixed size.
-//===--------------------------------------------------------------------===//
-template <typename KeyType, typename ValueType, typename Hasher>
-class MappingTable {
- public:
-  // Constructor
-  MappingTable() : MappingTable(1 << 20) {}
-
-  MappingTable(uint32_t initial_size) : size_(initial_size) {
-    table_ = new Entry* [initial_size];
-    for (uint32_t i = 0; i < initial_size; i++) {
-      table_[i] = nullptr;
-    }
-  }
-
-  // Destructor
-  ~MappingTable() {
-    if (table_ != nullptr) {
-      for (uint32_t i = 0; i < size_; i++) {
-        if (table_[i] != nullptr) {
-          delete table_[i];
-        }
-      }
-      delete[] table_;
-    }
-  }
-
-  // Get the mapping for the provided key
-  inline ValueType Get(KeyType key) const {
-    auto* entry = EntryFor(key);
-    return entry == nullptr ? nullptr : entry->val.load();
-  }
-
-  // CAS the mapping for the provided key whose expected value is also provided
-  inline bool Cas(KeyType key, ValueType old_val, ValueType new_val) {
-    auto* entry = EntryFor(key);
-    if (entry == nullptr) {
-      return false;
-    }
-    return entry->val.compare_exchange_strong(old_val, new_val);
-  }
-
-  // Perform a blind set
-  inline bool Insert(KeyType key, ValueType val) {
-    auto* curr_entry = EntryFor(key);
-    if (curr_entry != nullptr) {
-      return false;
-    }
-    uint64_t hash_value = HashFor(key);
-    Entry* entry = new Entry();
-    entry->hash = hash_value;
-    entry->key = key;
-    entry->val.store(val);
-    table_[hash_value] = entry;
-    return true;
-  }
-
-  inline bool Remove(KeyType key) {
-    uint64_t slot = HashFor(key) % size_;
-    if (table_[slot] == nullptr) {
-      return false;
-    }
-    Entry* e = table_[slot];
-    table_[slot] = nullptr;
-    delete e;
-    return true;
-  }
-
- private:
-  // The structures we actually store in the mapping table
-  struct Entry {
-    uint64_t hash;
-    KeyType key;
-    std::atomic<ValueType> val;
-  };
-
-  // Get the entry for the provided key
-  Entry* EntryFor(KeyType& key) const {
-    // TODO: Check keys, perform second hash etc.
-    uint64_t hash = HashFor(key);
-    return table_[hash % size_];
-  }
-
-  // Hash a given key
-  inline uint64_t HashFor(const KeyType key) const { return key_hasher_(key); }
-
- private:
-  // The mapping table
-  uint32_t size_;
-  Entry** table_;
-
-  // What we use to hash keys
-  Hasher key_hasher_;
-
- private:
-  // No funny business!
-  MappingTable(const MappingTable&) = delete;
-  MappingTable(MappingTable&&) = delete;
-  MappingTable& operator=(const MappingTable&) = delete;
-  MappingTable& operator=(MappingTable&&) = delete;
 };
 
 //===--------------------------------------------------------------------===//
@@ -445,9 +415,9 @@ class BWTree {
     };
     // The type
     NodeType node_type;
-  };
 
-  static const std::map<typename Node::NodeType, std::string> kNodeTypeToString;
+    virtual ~Node() {}
+  };
 
   //===--------------------------------------------------------------------===//
   // All non-delta nodes are data nodes.  Data nodes contain a high and low
@@ -472,6 +442,8 @@ class BWTree {
     //   pid_t child_pid;
     // }* entries;
     // This allows us to unify inner and leaf node types and simplify code
+
+    virtual ~DataNode() {}
   };
 
   //===--------------------------------------------------------------------===//
@@ -884,41 +856,35 @@ class BWTree {
    public:
     BWTreeIterator(
         const BWTree<KeyType, ValueType, KeyComparator, ValueComparator,
-                     KeyEqualityChecker>& tree,
-        uint32_t curr_idx, pid_t node_pid, Node* node,
+                     KeyEqualityChecker>* tree,
+        uint32_t curr_idx, pid_t node_pid,
         std::vector<std::pair<KeyType, ValueType>>&& collapsed_contents)
         : tree_(tree),
           curr_idx_(curr_idx),
           node_pid_(node_pid),
-          node_(node),
           collapsed_contents_(std::move(collapsed_contents)) {
       /* Nothing */
     }
 
     // Increment
     BWTreeIterator& operator++() {
-      // Enter the epoch
-      EpochGuard<NodeDeleter> guard{
-          const_cast<EpochManager<NodeDeleter>&>(tree_.epoch_manager_)};
-
       if (curr_idx_ + 1 < collapsed_contents_.size()) {
         curr_idx_++;
       } else {
-        // We've exhausted this node, find the next
-        pid_t right_sibling_pid = tree_.RightSibling(node_);
-        node_pid_ = right_sibling_pid;
+        // Enter the epoch
+        EpochGuard<NodeDeleter> guard{
+            const_cast<EpochManager<NodeDeleter>&>(tree_->epoch_manager_)};
+
+        Node* n = tree_->GetNode(node_pid_);
+        assert(tree_->IsLeaf(n));
+        node_pid_ = tree_->RightSibling(n);
         if (node_pid_ == kInvalidPid) {
-          // No more data
-          // LOG_DEBUG("At right-most leaf, no more data");
           curr_idx_ = 0;
-          node_ = nullptr;
           collapsed_contents_.clear();
         } else {
-          // LOG_DEBUG("Moving right to next tree node [%lu]", node_pid_);
           curr_idx_ = 0;
-          node_ = tree_.GetNode(node_pid_);
           collapsed_contents_.clear();
-          tree_.CollapseLeafData(node_, collapsed_contents_);
+          tree_->CollapseLeafData(n, collapsed_contents_);
         }
       }
       return *this;
@@ -926,7 +892,7 @@ class BWTree {
 
     // Equality/Inequality checks
     bool operator==(const BWTreeIterator& other) const {
-      return node_ == other.node_ && curr_idx_ == other.curr_idx_;
+      return node_pid_ == other.node_pid_ && curr_idx_ == other.curr_idx_;
     }
 
     bool operator!=(const BWTreeIterator& other) const {
@@ -934,14 +900,19 @@ class BWTree {
     }
 
     std::pair<KeyType, ValueType> operator*() const {
+      assert(curr_idx_ < collapsed_contents_.size());
       return collapsed_contents_[curr_idx_];
     }
 
-    // Access to the key the iterator points to
-    KeyType key() const { return collapsed_contents_[curr_idx_].first; }
+    KeyType key() const {
+      assert(curr_idx_ < collapsed_contents_.size());
+      return collapsed_contents_[curr_idx_].first;
+    }
 
-    // Access to the value the iterator points to
-    ValueType data() const { return collapsed_contents_[curr_idx_].second; }
+    ValueType data() const {
+      assert(curr_idx_ < collapsed_contents_.size());
+      return collapsed_contents_[curr_idx_].second;
+    }
 
     pid_t node() const { return node_pid_; }
 
@@ -949,10 +920,9 @@ class BWTree {
 
    private:
     const BWTree<KeyType, ValueType, KeyComparator, ValueComparator,
-                 KeyEqualityChecker>& tree_;
+                 KeyEqualityChecker>* tree_;
     uint32_t curr_idx_;
     pid_t node_pid_;
-    Node* node_;
     std::vector<std::pair<KeyType, ValueType>> collapsed_contents_;
   };
 
@@ -968,12 +938,11 @@ class BWTree {
          ValueComparator valueComparator, KeyEqualityChecker equals)
       : unique_keys_(unique_keys),
         pid_allocator_(0),
-        root_pid_(pid_allocator_++),
-        leftmost_leaf_pid_(root_pid_.load()),
-        rightmost_leaf_pid_(root_pid_.load()),
         key_comparator_(keyComparator),
         value_comparator_(valueComparator),
-        key_equals_(equals) {
+        key_equals_(equals),
+        mapping_table_(1 << 20),
+        epoch_manager_(EpochManager<NodeDeleter>::GetInstance()) {
     // Create a new root page
     LeafNode* root = new LeafNode();
     root->node_type = Node::NodeType::Leaf;
@@ -981,11 +950,22 @@ class BWTree {
     root->num_entries = 0;
     root->keys = nullptr;
     root->vals = nullptr;
-    // Insert into mapping table
-    mapping_table_.Insert(root_pid_, root);
 
-    // Stop epoch management
-    epoch_manager_.Init();
+    // Insert into mapping table
+    pid_t root_pid = NewNode(root);
+    root_pid_.store(root_pid);
+
+    leftmost_leaf_pid_ = root_pid;
+    rightmost_leaf_pid_.store(root_pid);
+  }
+
+  ~BWTree() {
+    for (uint64_t i = 0; i < mapping_table_.size(); i++) {
+      Node* node = mapping_table_[i].load();
+      if (node != nullptr) {
+        FreeNode(node);
+      }
+    }
   }
 
   pid_t FindOnLevel(pid_t node_pid, KeyType key) {
@@ -1067,13 +1047,7 @@ class BWTree {
       new_root->children[1] = right_pid;
 
       // Insert new root into mapping table
-      pid_t new_root_pid = NextPid();
-#ifndef NDEBUG
-      bool inserted = mapping_table_.Insert(new_root_pid, new_root);
-      assert(inserted);
-#else
-      mapping_table_.Insert(new_root_pid, new_root);
-#endif
+      pid_t new_root_pid = NewNode(new_root);
 
       // CAS in
       if (root_pid_.compare_exchange_strong(split_node_pid, new_root_pid)) {
@@ -1087,7 +1061,7 @@ class BWTree {
       }
 
       // CAS failed, try again
-      mapping_table_.Remove(new_root_pid);
+      Remove(new_root_pid);
       delete new_root;
 
       parent_pid = root_pid_.load();
@@ -1117,7 +1091,7 @@ class BWTree {
       auto* index = DeltaIndex::Create(low_key, high_key, right_pid,
                                        NodeSize(parent) + 1, parent);
       index->rightmost = right_pid == rightmost_leaf_pid_.load();
-      if (mapping_table_.Cas(parent_pid, parent, index)) {
+      if (Cas(parent_pid, parent, index)) {
         // Successful Cas
         AddAllocatedBytes(index);
         LOG_DEBUG(
@@ -1149,7 +1123,6 @@ class BWTree {
 
     KeyType split_key;
     KeyType high_key;
-    pid_t new_right_pid = kInvalidPid;
     bool we_did_split = false;
     while (true) {
       // Check if all this is necessary
@@ -1165,21 +1138,6 @@ class BWTree {
       // to complete the second half of the split logic (delta index insertion
       // at the parent)
       if (NodeSize(node) < insert_branch_factor) {
-        /*
-        Node* tmp = node;
-        while (tmp->node_type != Node::NodeType::DeltaSplit &&
-               tmp->node_type != Node::NodeType::DeltaSplitInner) {
-          assert(tmp->node_type != Node::NodeType::Inner &&
-                 tmp->node_type != Node::NodeType::Leaf);
-          DeltaNode* delta = static_cast<DeltaNode*>(tmp);
-          tmp = delta->next;
-        }
-        DeltaSplit* split = static_cast<DeltaSplit*>(tmp);
-        split_key = split->split_key;
-        high_key = split->high_key;
-        new_right_pid = split->new_right;
-        break;
-        */
         return;
       }
 
@@ -1240,13 +1198,8 @@ class BWTree {
       }
 
       // Step 2: Insert node holding right-half of split into mapping table
-      new_right_pid = NextPid();
-#ifndef NDEBUG
-      bool inserted = mapping_table_.Insert(new_right_pid, new_right);
-      assert(inserted);
-#else
-      mapping_table_.Insert(new_right_pid, new_right);
-#endif
+      pid_t new_right_pid = NewNode(new_right);
+      assert(new_right_pid != kInvalidPid);
 
       uint32_t new_left_size = NodeSize(node) - NodeSize(new_right);
       LOG_DEBUG(
@@ -1265,7 +1218,7 @@ class BWTree {
                                         new_left_size, node);
       }
 
-      if (mapping_table_.Cas(node_pid, node, split)) {
+      if (Cas(node_pid, node, split)) {
         // Success, proceed to the next step
         AddAllocatedBytes(new_right);
         AddAllocatedBytes(split);
@@ -1287,30 +1240,30 @@ class BWTree {
             // enough inserts to be split multiple times.
           }
         }
-        break;
+        if (we_did_split) {
+          LOG_DEBUG(
+              "Installed split-delta node on %lu. Attempting to insert new "
+              "split index delta on parent ...",
+              node_pid);
+        } else {
+          LOG_DEBUG(
+              "Someone else installed split-delta node on %lu. Attempting to "
+              "insert new split index delta on parent ...",
+              node_pid);
+        }
+
+        // Step 4: Try to install the delta into the parent inner node
+        InstallIndexDelta(node_pid, new_right_pid, split_key, high_key,
+                          traversal);
+        return;
       }
 
       // Failed, cleanup and try again
       LOG_DEBUG("Failed CAS split-delta onto node [%lu], retrying", node_pid);
-      mapping_table_.Remove(new_right_pid);
+      Remove(new_right_pid);
       delete new_right;
       delete split;
     }
-
-    if (we_did_split) {
-      LOG_DEBUG(
-          "Installed split-delta node on %lu. Attempting to insert new "
-          "split index delta on parent ...",
-          node_pid);
-    } else {
-      LOG_DEBUG(
-          "Someone else installed split-delta node on %lu. Attempting to "
-          "insert new split index delta on parent ...",
-          node_pid);
-    }
-
-    // Step 4: Try to install the delta into the parent inner node
-    InstallIndexDelta(node_pid, new_right_pid, split_key, high_key, traversal);
   }
 
   // Insertion
@@ -1341,8 +1294,10 @@ class BWTree {
       // insertion.  Let's try to CAS in the delta insert node.
       auto* delta_insert =
           DeltaInsert::Create(key, value, leaf, num_entries + 1);
-      if (mapping_table_.Cas(leaf_pid, leaf, delta_insert)) {
+      if (Cas(leaf_pid, leaf, delta_insert)) {
         // SUCCESS
+        LOG_DEBUG("Inserted delta (%p) onto [%lu] (%p)", delta_insert, leaf_pid,
+                  leaf);
         AddAllocatedBytes(delta_insert);
         if (num_entries > insert_branch_factor) {
           // Split the leaf we inserted into
@@ -1409,8 +1364,10 @@ class BWTree {
       // TODO: wrap in while loop for multi threaded cases
       auto delta_delete =
           DeltaDelete::Create(key, value, num_entries - 1, prev_root);
-      if (mapping_table_.Cas(prev_root_pid, prev_root, delta_delete)) {
+      if (Cas(prev_root_pid, prev_root, delta_delete)) {
         // SUCCESS
+        LOG_DEBUG("Inserted delta (%p) onto [%lu] (%p)", delta_delete,
+                  prev_root_pid, prev_root);
         AddAllocatedBytes(delta_delete);
         if (num_entries < delete_branch_factor) {
           // Merge(result.leaf_node, node_pid, deltaInsert);
@@ -1421,7 +1378,6 @@ class BWTree {
         } else if (leaf_needs_consolidation) {
           ConsolidateNode(result.node_pid);
         }
-        LOG_DEBUG("Inserted delta delete to node %lu", prev_root_pid);
         break;
       } else {
         // The CAS failed, delete the node and retry
@@ -1458,12 +1414,12 @@ class BWTree {
 
     uint32_t slot = found_pos - vals.begin();
 
-    LOG_DEBUG("Found key in leaf slot %d", slot);
+    LOG_DEBUG("Found key in leaf slot %d or (%p)", slot, result.node);
     if (result.node_to_consolidate != kInvalidPid) {
       ConsolidateNode(result.node_to_consolidate);
     }
 
-    return Iterator{*this, slot, result.node_pid, result.node, std::move(vals)};
+    return Iterator{this, slot, result.node_pid, std::move(vals)};
   }
 
   // Get the total size of the tree in bytes. This represents the total amount
@@ -1473,16 +1429,18 @@ class BWTree {
 
   // C++ container iterator functions (hence, why they're not capitalized)
   Iterator begin() const {
+    // Enter the epoch
+    EpochGuard<NodeDeleter> guard{epoch_manager_};
+
     Node* leftmost_leaf = GetNode(leftmost_leaf_pid_);
     std::vector<std::pair<KeyType, ValueType>> vals;
     CollapseLeafData(leftmost_leaf, vals);
-    return Iterator{*this, 0, leftmost_leaf_pid_, leftmost_leaf,
-                    std::move(vals)};
+    return Iterator{this, 0, leftmost_leaf_pid_, std::move(vals)};
   }
 
   Iterator end() const {
     std::vector<std::pair<KeyType, ValueType>> empty;
-    return Iterator{*this, 0, kInvalidPid, nullptr, std::move(empty)};
+    return Iterator{this, 0, kInvalidPid, std::move(empty)};
   }
 
  private:
@@ -1898,7 +1856,7 @@ class BWTree {
 
     // Put all leaf data into the output vector
     for (uint32_t i = 0; i < leaf->num_entries; i++) {
-      output.push_back(std::make_pair(leaf->keys[i], leaf->vals[i]));
+      output.emplace_back(leaf->keys[i], leaf->vals[i]);
     }
 #ifndef NDEBUG
     uint32_t base_size = output.size();
@@ -1989,9 +1947,6 @@ class BWTree {
   }
 
   void ConsolidateInnerNode(pid_t node_pid) {
-#ifndef NDEBUG
-    uint32_t attempt = 0;
-#endif
     while (true) {
       // Get the current node
       Node* node = GetNode(node_pid);
@@ -2007,9 +1962,6 @@ class BWTree {
         LOG_DEBUG("Node [%lu] no longer needs consolidation", node_pid);
         return;
       }
-
-      LOG_DEBUG("Consolidating inner-node %lu (%p). Attempt %u", node_pid, node,
-                attempt++);
 
       // Consolidate data
       std::vector<std::pair<KeyType, pid_t>> vals;
@@ -2028,29 +1980,13 @@ class BWTree {
       consolidated->children[vals.size()] = rightmost.second;
 
       // CAS
-      if (mapping_table_.Cas(node_pid, node, consolidated)) {
+      if (Cas(node_pid, node, consolidated)) {
         AddAllocatedBytes(consolidated);
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
         LOG_DEBUG(
             "SUCCESS: Inner node %lu consolidated to (%p). Old chain+node "
             "(%p) marked as garbage",
             node_pid, consolidated, node);
-
-#ifndef NDEBUG
-        std::string out;
-        bool first = true;
-        for (uint32_t i = 0; i < consolidated->num_entries; i++) {
-          if (!first) out.append(", ");
-          first = false;
-          out.append(std::to_string(consolidated->children[i]));
-          if (i < consolidated->num_entries - 1) out.append(", K");
-        }
-        out.append(", ");
-        out.append(
-            std::to_string(consolidated->children[consolidated->num_entries]));
-        LOG_DEBUG("Node after consolidation: %s", out.c_str());
-#endif
-
         return;
       }
 
@@ -2072,8 +2008,6 @@ class BWTree {
         return;
       }
 
-      LOG_DEBUG("Attempting to consolidate leaf-node %lu (%p)", node_pid, node);
-
       // Consolidate data
       std::vector<std::pair<KeyType, ValueType>> vals;
       std::pair<pid_t, pid_t> links = CollapseLeafData(node, vals);
@@ -2087,7 +2021,7 @@ class BWTree {
         consolidated->vals[i] = vals[i].second;
       }
 
-      if (mapping_table_.Cas(node_pid, node, consolidated)) {
+      if (Cas(node_pid, node, consolidated)) {
         // Mark the node as deleted
         AddAllocatedBytes(consolidated);
         epoch_manager_.MarkDeleted(NodeDeleter{this, node});
@@ -2103,12 +2037,6 @@ class BWTree {
       delete consolidated;
     }
   }
-
-  // Get the node with the given pid
-  Node* GetNode(pid_t node_pid) const { return mapping_table_.Get(node_pid); }
-
-  // Get the root node
-  Node* GetRoot() const { return GetNode(root_pid_.load()); }
 
   // Is the given node a leaf node
   bool IsLeaf(const Node* node) const {
@@ -2257,10 +2185,7 @@ class BWTree {
 
   // Delete the memory for this node's delta chain and base node
   void FreeNode(Node* node) {
-    LOG_DEBUG("Freeing node (%p)", node);
-#ifndef NDEBUG
-    uint32_t chain_length = 0;
-#endif
+    // LOG_DEBUG("Freeing (%p)", node);
     Node* curr = node;
     while (curr->node_type != Node::NodeType::Inner &&
            curr->node_type != Node::NodeType::Leaf) {
@@ -2270,34 +2195,54 @@ class BWTree {
         DeltaMerge* merge = static_cast<DeltaMerge*>(curr);
         FreeNode(GetNode(merge->old_right_pid));
       }
-
       // Delete the delta's memory
       DeltaNode* delta = static_cast<DeltaNode*>(curr);
+      // LOG_DEBUG("Freeing (%p)", delta);
       MarkReclaimedBytes(delta);
       curr = delta->next;
       delete delta;
-#ifndef NDEBUG
-      chain_length++;
-#endif
     }
-#ifndef NDEBUG
-    auto node_type = curr->node_type;
-#endif
+    // LOG_DEBUG("Freeing (%p)", curr);
     MarkReclaimedBytes(curr);
     delete curr;
-
-    LOG_DEBUG("Freed node (%p) type %d with chain length of %u", node,
-              node_type, chain_length);
   }
 
   // We do co-operative epoch-based GC
-  void Cleanup() {
-    // Nothing
+  void Cleanup() {}
+
+  // MAPPING TABLE STUFF
+
+  // Get the node with the given pid
+  Node* GetNode(pid_t node_pid) const {
+    return mapping_table_[node_pid].load();
+  }
+
+  bool Cas(pid_t pid, Node* old, Node* new_node) {
+    assert(pid < mapping_table_.size());
+    return mapping_table_[pid].compare_exchange_strong(old, new_node);
+  }
+
+  // Blind
+  void Insert(pid_t pid, Node* node) {
+    assert(pid < mapping_table_.size());
+    mapping_table_[pid].store(node);
+  }
+
+  // Blind
+  void Remove(pid_t pid) {
+    assert(pid < mapping_table_.size());
+    mapping_table_[pid].store(nullptr);
   }
 
   // Return the next free/available PID
   // TODO: We need to reclaim PID
   pid_t NextPid() { return pid_allocator_++; }
+
+  pid_t NewNode(Node* node) {
+    pid_t pid = NextPid();
+    Insert(pid, node);
+    return pid;
+  }
 
  private:
   // Does this index support duplicate keys?
@@ -2328,19 +2273,19 @@ class BWTree {
   KeyEqualityChecker key_equals_;
 
   // The mapping table
-  MappingTable<pid_t, Node*, DumbHash> mapping_table_;
+  std::vector<std::atomic<Node*>> mapping_table_;
 
   // The epoch manager
-  EpochManager<NodeDeleter> epoch_manager_;
+  EpochManager<NodeDeleter>& epoch_manager_;
 
   // TODO: just a randomly chosen number now...
   uint32_t delete_branch_factor = 100;
-  uint32_t insert_branch_factor = (1024 * 64) / (sizeof(KeyType) + sizeof(ValueType));
+  uint32_t insert_branch_factor = 100;
   uint32_t chain_length_threshold = 10;
 
-  std::atomic<uint64_t> num_failed_cas_;
-  std::atomic<uint64_t> num_consolidations_;
-  std::atomic<uint64_t> size_in_bytes_;
+  std::atomic<uint64_t> num_failed_cas_{0};
+  std::atomic<uint64_t> num_consolidations_{0};
+  std::atomic<uint64_t> size_in_bytes_{0};
 };
 
 }  // End index namespace
